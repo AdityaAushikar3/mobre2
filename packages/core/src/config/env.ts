@@ -121,7 +121,10 @@ const envSchema = z.object({
   /** Allow normal public student registration */
   LMS_OPEN_SIGNUP: z.string().optional(),
   /** Restrict authentication to Google only */
-  LMS_GOOGLE_ONLY: z.string().optional()
+  LMS_GOOGLE_ONLY: z.string().optional(),
+  /** Razorpay payment gateway credentials */
+  RAZORPAY_KEY_ID: z.string().optional(),
+  RAZORPAY_KEY_SECRET: z.string().optional()
 });
 
 export const env = envSchema.parse(process.env);

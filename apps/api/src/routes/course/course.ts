@@ -66,6 +66,7 @@ import { newsfeedRouter } from '@api/routes/course/newsfeed';
 import { orgAdminMiddleware } from '@api/middlewares/org-admin';
 import { orgMemberMiddleware } from '@api/middlewares/org-member';
 import { paymentRequestRouter } from '@api/routes/course/payment-request';
+import { purchaseRouter } from '@api/routes/course/purchase';
 import { presignRouter } from '@api/routes/course/presign';
 import { assertMcpAutomationUsageAllowed, recordMcpAutomationUsage } from '@api/services/organization/automation-usage';
 import { sectionRouter } from '@api/routes/course/section';
@@ -109,6 +110,7 @@ export const courseRouter = new Hono()
   .route('/template', courseTemplateRouter)
   .route('/:courseId/template', courseTemplateActionsRouter)
   .route('/:courseId/template-updates', courseTemplateUpdatesRouter)
+  .route('/:courseId/purchase', purchaseRouter)
   /**
    * GET /course/slug/:slug
    * Gets a course by slug (public route, no authentication required)
