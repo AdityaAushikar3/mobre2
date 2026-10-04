@@ -115,7 +115,13 @@ const envSchema = z.object({
   /** Supadata API key for YouTube caption fetching. Leave unset to disable YouTube transcripts. */
   SUPADATA_API_KEY: z.string().optional(),
   /** YouTube caption provider identifier (default 'supadata'). */
-  YOUTUBE_CAPTION_PROVIDER: z.string().optional()
+  YOUTUBE_CAPTION_PROVIDER: z.string().optional(),
+  /** Designated platform administrator email */
+  LMS_ADMIN_EMAIL: z.string().email().optional(),
+  /** Allow normal public student registration */
+  LMS_OPEN_SIGNUP: z.string().optional(),
+  /** Restrict authentication to Google only */
+  LMS_GOOGLE_ONLY: z.string().optional()
 });
 
 export const env = envSchema.parse(process.env);

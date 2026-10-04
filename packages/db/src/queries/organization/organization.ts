@@ -1039,8 +1039,8 @@ export const getFirstOrganizationWithPlans = async (): Promise<
  * Gets the number of organizations - used for self-hosted to block org creation when org exists
  * @returns Count of organizations
  */
-export const getOrganizationCount = async (): Promise<number> => {
-  const [result] = await db.select({ count: sql<number>`count(*)::int`.as('count') }).from(schema.organization);
+export const getOrganizationCount = async (dbClient: DbOrTxClient = db): Promise<number> => {
+  const [result] = await dbClient.select({ count: sql<number>`count(*)::int`.as('count') }).from(schema.organization);
 
   return result?.count ?? 0;
 };

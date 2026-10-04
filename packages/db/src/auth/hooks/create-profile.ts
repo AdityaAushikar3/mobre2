@@ -80,6 +80,17 @@ export const createProfileHook = async (user: User, _request?: Request) => {
 
     // Run SSO provisioning hook for JIT org membership (email-domain match)
     await ssoProvisioningHook(user);
+
+    // LMS_OPEN_SIGNUP auto-provisioning
+    const isAdmin =
+      process.env.LMS_ADMIN_EMAIL && user.email?.toLowerCase() === process.env.LMS_ADMIN_EMAIL.toLowerCase();
+    if (!isAdmin && process.env.PUBLIC_IS_SELFHOSTED === 'true' && process.env.LMS_OPEN_SIGNUP === 'true') {
+      const { ensureSelfHostedStudentMembership } = await import('@db/queries/organization');
+      await ensureSelfHostedStudentMembership({
+        profileId: user.id,
+        email: user.email
+      });
+    }
   } catch (error) {
     console.error('Error creating profile for user:', error);
   }

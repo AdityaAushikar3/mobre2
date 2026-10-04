@@ -118,6 +118,29 @@ export const handle: Handle = async (args) => {
 
   if (sessionData) {
     event.locals = sessionData;
+
+    // Phase 1: JIT provisioning fallback if signup raced with org creation
+    const isAdmin =
+      process.env.LMS_ADMIN_EMAIL &&
+      event.locals.user?.email?.toLowerCase() === process.env.LMS_ADMIN_EMAIL.toLowerCase();
+
+    if (
+      !isAdmin &&
+      event.locals.organizations?.length === 0 &&
+      process.env.PUBLIC_IS_SELFHOSTED === 'true' &&
+      process.env.LMS_OPEN_SIGNUP === 'true'
+    ) {
+      const { ensureSelfHostedStudentMembership } = await import('@cio/db/queries/organization');
+      const provisioned = await ensureSelfHostedStudentMembership({
+        profileId: event.locals.user?.id || '',
+        email: event.locals.user?.email
+      });
+      if (provisioned) {
+        // Refresh session data so the rest of the request sees the new organization
+        const refreshed = await getSessionData(event.cookies);
+        if (refreshed) event.locals = refreshed;
+      }
+    }
   }
 
   const isApiRequest = event.url.pathname.includes('/api');

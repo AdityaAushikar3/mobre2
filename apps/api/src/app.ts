@@ -167,6 +167,20 @@ export const app = new Hono()
       }
     }
 
+    // Phase 1 - Google-Only Authentication
+    if (c.req.method === 'POST' && c.req.path === '/api/auth/sign-up/email') {
+      if (process.env.LMS_GOOGLE_ONLY === 'true') {
+        return c.json(
+          {
+            success: false,
+            error: "Email signup is disabled on this instance. Please use Google.",
+            code: ErrorCodes.VALIDATION_ERROR
+          },
+          403
+        );
+      }
+    }
+
     const response = await auth.handler(request);
 
     // Outbound: if the OAuth callback redirected to

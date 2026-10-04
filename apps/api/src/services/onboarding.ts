@@ -8,12 +8,14 @@ import {
   getOrganizationByProfileId,
   getOrganizationCount
 } from '@cio/db/queries';
-import { markWelcomeEmailPending, updateProfile } from '@cio/db/queries/auth';
+import { markWelcomeEmailPending, updateProfile, getProfileById } from '@cio/db/queries/auth';
 
 import { env } from '@cio/core/config/env';
 import { ROLE } from '@cio/utils/constants';
 import { PLAN } from '@cio/utils/plans';
 import { db } from '@cio/db/drizzle';
+import { eq, sql } from 'drizzle-orm';
+import * as schema from '@cio/db/schema';
 
 export async function createOrganizationWithOwner(
   profileId: string,
@@ -23,11 +25,27 @@ export async function createOrganizationWithOwner(
     siteName: string;
   }
 ) {
-  // Self-hosted: block org creation when an org already exists
+  // Self-hosted: enforce admin email matching before allowing org creation
   if (env.PUBLIC_IS_SELFHOSTED === 'true') {
-    const count = await getOrganizationCount();
-    if (count > 0) {
-      throw new AppError('Self-hosted instances support only one organization', ErrorCodes.VALIDATION_ERROR, 403);
+    if (!env.LMS_ADMIN_EMAIL) {
+      throw new AppError(
+        'Platform administrator email is not configured (LMS_ADMIN_EMAIL)',
+        ErrorCodes.VALIDATION_ERROR,
+        403
+      );
+    }
+    const authUsers = await db.select().from(schema.user).where(eq(schema.user.id, profileId)).limit(1);
+    const authUser = authUsers[0];
+    if (
+      !authUser ||
+      !authUser.emailVerified ||
+      authUser.email?.toLowerCase().trim() !== env.LMS_ADMIN_EMAIL.toLowerCase().trim()
+    ) {
+      throw new AppError(
+        'Only the verified designated administrator can create the platform organization',
+        ErrorCodes.VALIDATION_ERROR,
+        403
+      );
     }
   }
 
@@ -41,6 +59,15 @@ export async function createOrganizationWithOwner(
   // Business Logic: Create org and member in a transaction
   try {
     const result = await db.transaction(async (tx) => {
+      // Self-hosted: block org creation when an org already exists (with row exclusive lock)
+      if (env.PUBLIC_IS_SELFHOSTED === 'true') {
+        await tx.execute(sql`LOCK TABLE "organization" IN SHARE ROW EXCLUSIVE MODE`);
+        const count = await getOrganizationCount(tx);
+        if (count > 0) {
+          throw new AppError('Self-hosted instances support only one organization', ErrorCodes.VALIDATION_ERROR, 403);
+        }
+      }
+
       const organization = await createOrganization(
         {
           name: input.orgName,
