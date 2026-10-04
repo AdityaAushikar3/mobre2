@@ -183,6 +183,13 @@
       "when": 1790553000000,
       "tag": "0025_add_turkish_locale",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1791106373211,
+      "tag": "0026_complex_speed",
+      "breakpoints": true
     }
   ]
 }
