@@ -4272,3 +4272,60 @@ export const contentReport = pgTable(
       .where(sql`${table.reporterId} IS NOT NULL AND ${table.status} IN ('open', 'in_review')`)
   ]
 );
+
+export const courseOrderStatus = pgEnum('COURSE_ORDER_STATUS', ['CREATED', 'PAID']);
+
+export const courseOrderAttentionReason = pgEnum('COURSE_ORDER_ATTENTION_REASON', [
+  'DUPLICATE_PAYMENT',
+  'ALREADY_ENROLLED',
+  'AMOUNT_MISMATCH',
+  'ENROLLMENT_FAILED'
+]);
+
+export const courseOrder = pgTable(
+  'course_order',
+  {
+    id: uuid('id')
+      .default(sql`gen_random_uuid()`)
+      .primaryKey()
+      .notNull(),
+    organizationId: uuid('organization_id').notNull(),
+    userId: uuid('user_id').notNull(),
+    courseId: uuid('course_id').notNull(),
+    amountPaise: integer('amount_paise').notNull(),
+    currency: varchar('currency', { length: 3 }).default('INR').notNull(),
+    razorpayOrderId: varchar('razorpay_order_id').notNull(),
+    razorpayPaymentId: varchar('razorpay_payment_id'),
+    status: courseOrderStatus('status').default('CREATED').notNull(),
+    paidAt: timestamp('paid_at', { withTimezone: true, mode: 'string' }),
+    needsAttention: boolean('needs_attention').default(false).notNull(),
+    attentionReason: courseOrderAttentionReason('attention_reason'),
+    attentionPaymentIds: jsonb('attention_payment_ids').default([]),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'string' }).defaultNow()
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.organizationId],
+      foreignColumns: [organization.id],
+      name: 'course_order_organization_id_fkey'
+    }).onDelete('restrict'),
+    foreignKey({
+      columns: [table.userId],
+      foreignColumns: [user.id],
+      name: 'course_order_user_id_fkey'
+    }).onDelete('restrict'),
+    foreignKey({
+      columns: [table.courseId],
+      foreignColumns: [course.id],
+      name: 'course_order_course_id_fkey'
+    }).onDelete('restrict'),
+    check('course_order_amount_paise_check', sql`${table.amountPaise} > 0`),
+    check('course_order_currency_check', sql`${table.currency} = 'INR'`),
+    unique('course_order_razorpay_order_id_key').on(table.razorpayOrderId),
+    uniqueIndex('course_order_razorpay_payment_id_unique')
+      .on(table.razorpayPaymentId)
+      .where(sql`${table.razorpayPaymentId} IS NOT NULL`),
+    index('idx_course_order_user_course').on(table.userId, table.courseId)
+  ]
+);
