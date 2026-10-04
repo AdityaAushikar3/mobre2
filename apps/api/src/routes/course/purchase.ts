@@ -13,7 +13,7 @@ export const purchaseRouter = new Hono()
     try {
       const courseId = c.req.param('courseId')!;
       const user = c.get('user')!;
-      const organizationId = c.get('organizationId')!;
+      const organizationId = c.get('orgId')!;
 
       const result = await createCoursePurchase(courseId, user.id, organizationId);
 

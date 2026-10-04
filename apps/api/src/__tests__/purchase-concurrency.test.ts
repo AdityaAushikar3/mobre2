@@ -132,6 +132,24 @@ describe('Course Purchase Concurrency & State', () => {
       );
     });
 
+    it('CREATED ENROLLMENT_FAILED blocks purchase even if needsAttention is false', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: `order_failed_${Date.now()}`,
+        status: 'CREATED',
+        needsAttention: false,
+        attentionReason: 'ENROLLMENT_FAILED'
+      });
+
+      await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+        'Your payment is being processed. Please contact support if this takes long.'
+      );
+    });
+
     it('PAID ENROLLMENT_FAILED does NOT block as unresolved purchase', async () => {
       await db.insert(schema.courseOrder).values({
         organizationId: orgId,
@@ -202,6 +220,21 @@ describe('Course Purchase Concurrency & State', () => {
       );
     });
 
+    it('cross-organization course rejection', async () => {
+      const otherOrgId = crypto.randomUUID();
+      await db.insert(schema.organization).values({
+        id: otherOrgId,
+        name: 'Other Org',
+        slug: `other-org-${Date.now()}`
+      });
+
+      await expect(createCoursePurchase(courseId, userId, otherOrgId)).rejects.toThrow(
+        'Course not found in this organization'
+      );
+
+      await db.delete(schema.organization).where(eq(schema.organization.id, otherOrgId));
+    });
+
     describe('Pricing validation', () => {
       it('rejects 0 cost', async () => {
         await db.update(schema.course).set({ cost: 0 }).where(eq(schema.course.id, courseId));
@@ -214,6 +247,22 @@ describe('Course Purchase Concurrency & State', () => {
         await db.update(schema.course).set({ cost: -50 }).where(eq(schema.course.id, courseId));
         await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
           'Course cost is below the minimum allowed for purchase'
+        );
+      });
+
+      it('rejects PostgreSQL integer overflow (amountPaise > 2147483647)', async () => {
+        // 22000000 is 2.2 billion paise, which exceeds 2147483647
+        await db.update(schema.course).set({ cost: 22000000 }).where(eq(schema.course.id, courseId));
+        await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+          'Course price exceeds maximum allowed value'
+        );
+      });
+
+      it('rejects unsafe integer amount (amountPaise > Number.MAX_SAFE_INTEGER)', async () => {
+        // Just having cost be MAX_SAFE_INTEGER / 100 will trigger the safe integer bound
+        await db.update(schema.course).set({ cost: 90071992547410 }).where(eq(schema.course.id, courseId));
+        await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+          'Course price is not a safe integer in paise'
         );
       });
 

@@ -8,6 +8,7 @@ import Razorpay from 'razorpay';
 import crypto from 'crypto';
 
 const MIN_AMOUNT_PAISE = 100;
+const MAX_AMOUNT_PAISE = 2147483647; // PostgreSQL integer upper bound
 
 function getRazorpayClient() {
   if (!env.RAZORPAY_KEY_ID || !env.RAZORPAY_KEY_SECRET) {
@@ -29,6 +30,19 @@ export async function createCoursePurchase(courseId: string, userId: string, org
       throw new AppError('Course not found', ErrorCodes.COURSE_NOT_FOUND, 404);
     }
 
+    // Validate organization boundary via the group
+    if (!course.groupId) {
+      throw new AppError(
+        'Course is not properly configured for purchases (missing group)',
+        ErrorCodes.VALIDATION_ERROR,
+        400
+      );
+    }
+    const [group] = await tx.select().from(schema.group).where(eq(schema.group.id, course.groupId)).limit(1);
+    if (!group || group.organizationId !== organizationId) {
+      throw new AppError('Course not found in this organization', ErrorCodes.COURSE_NOT_FOUND, 404);
+    }
+
     if (course.currency !== 'INR') {
       throw new AppError('Only INR is supported for purchases', ErrorCodes.VALIDATION_ERROR, 400);
     }
@@ -39,8 +53,17 @@ export async function createCoursePurchase(courseId: string, userId: string, org
     }
 
     const amountPaise = cost * 100;
+
+    if (!Number.isSafeInteger(amountPaise)) {
+      throw new AppError('Course price is not a safe integer in paise', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
     if (amountPaise < MIN_AMOUNT_PAISE) {
       throw new AppError('Course cost is below the minimum allowed for purchase', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    if (amountPaise > MAX_AMOUNT_PAISE) {
+      throw new AppError('Course price exceeds maximum allowed value', ErrorCodes.VALIDATION_ERROR, 400);
     }
 
     // Ensure it's an exact integer, do not silently round
@@ -57,8 +80,7 @@ export async function createCoursePurchase(courseId: string, userId: string, org
           eq(schema.courseOrder.userId, userId),
           eq(schema.courseOrder.courseId, courseId),
           eq(schema.courseOrder.status, 'CREATED'),
-          eq(schema.courseOrder.attentionReason, 'ENROLLMENT_FAILED'),
-          eq(schema.courseOrder.needsAttention, true)
+          eq(schema.courseOrder.attentionReason, 'ENROLLMENT_FAILED')
         )
       )
       .limit(1);
