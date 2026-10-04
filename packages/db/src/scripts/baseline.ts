@@ -69,9 +69,7 @@ export async function baselineMigrationsIfNeeded(sql: Sql): Promise<void> {
       `;
       if (hasBaseline[0].count === 0) {
         await sql`INSERT INTO drizzle.__drizzle_migrations ("hash", "created_at") VALUES (${baseline.hash}, ${baseline.when})`;
-        console.log(
-          'Pre-squash migration history detected — baselined consolidated migration as already applied.'
-        );
+        console.log('Pre-squash migration history detected — baselined consolidated migration as already applied.');
       }
       return;
     }

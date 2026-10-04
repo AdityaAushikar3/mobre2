@@ -173,7 +173,7 @@ export const app = new Hono()
         return c.json(
           {
             success: false,
-            error: "Email signup is disabled on this instance. Please use Google.",
+            error: 'Email signup is disabled on this instance. Please use Google.',
             code: ErrorCodes.VALIDATION_ERROR
           },
           403

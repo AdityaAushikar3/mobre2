@@ -19,8 +19,7 @@ if (dsn && isProd && !isSelfHosted) {
     // process-error-guards.ts registers handlers with transient Redis filtering.
     integrations(integrations) {
       return integrations.filter(
-        (integration) =>
-          integration.name !== 'OnUncaughtException' && integration.name !== 'OnUnhandledRejection'
+        (integration) => integration.name !== 'OnUncaughtException' && integration.name !== 'OnUnhandledRejection'
       );
     }
   });
