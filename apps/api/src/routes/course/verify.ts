@@ -10,16 +10,36 @@ import Razorpay from 'razorpay';
 import { markPaidAndEnroll, type VerifiedPayment } from '@cio/core/services/course/payment';
 import { enrollStudentInCourseTransaction, runPostCommitSideEffects } from '../../services/course/payment';
 
-export const verifyRouter = new Hono().post('/:id/verify', authMiddleware, async (c) => {
+export const verifyRouter = new Hono().post('/orders/:orderId/verify', authMiddleware, async (c) => {
   try {
-    const orderId = c.req.param('id');
+    const orderId = c.req.param('orderId');
     const user = c.get('user')!;
 
-    const body = await c.req.json();
+    let body;
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new AppError('Invalid JSON body', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new AppError('Request body must be a JSON object', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = body;
 
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      throw new AppError('Missing payment verification details', ErrorCodes.VALIDATION_ERROR, 400);
+    if (!razorpay_order_id || typeof razorpay_order_id !== 'string') {
+      throw new AppError('Invalid or missing razorpay_order_id', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+    if (!razorpay_payment_id || typeof razorpay_payment_id !== 'string') {
+      throw new AppError('Invalid or missing razorpay_payment_id', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+    if (
+      !razorpay_signature ||
+      typeof razorpay_signature !== 'string' ||
+      !/^[a-fA-F0-9]{64}$/.test(razorpay_signature)
+    ) {
+      throw new AppError('Invalid or missing razorpay_signature', ErrorCodes.VALIDATION_ERROR, 400);
     }
 
     const [order] = await db.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, orderId)).limit(1);
@@ -45,7 +65,10 @@ export const verifyRouter = new Hono().post('/:id/verify', authMiddleware, async
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
       .digest('hex');
 
-    if (!crypto.timingSafeEqual(Buffer.from(generatedSignature), Buffer.from(razorpay_signature))) {
+    const expectedBuffer = Buffer.from(generatedSignature);
+    const actualBuffer = Buffer.from(razorpay_signature);
+
+    if (expectedBuffer.length !== actualBuffer.length || !crypto.timingSafeEqual(expectedBuffer, actualBuffer)) {
       throw new AppError('Invalid payment signature', ErrorCodes.VALIDATION_ERROR, 400);
     }
 
@@ -57,12 +80,23 @@ export const verifyRouter = new Hono().post('/:id/verify', authMiddleware, async
     let payment;
     try {
       payment = await razorpay.payments.fetch(razorpay_payment_id);
-    } catch (err) {
-      throw new AppError('Payment not found in provider', ErrorCodes.NOT_FOUND, 404);
+    } catch (err: any) {
+      if (err?.statusCode === 404 || err?.error?.code === 'BAD_REQUEST_ERROR') {
+        throw new AppError('Payment not found in provider', ErrorCodes.NOT_FOUND, 404);
+      }
+      throw new AppError('Failed to verify payment with provider', ErrorCodes.INTERNAL_ERROR, 502);
+    }
+
+    if (payment.id !== razorpay_payment_id) {
+      throw new AppError('Provider payment ID does not match requested payment ID', ErrorCodes.VALIDATION_ERROR, 400);
     }
 
     if (payment.order_id !== razorpay_order_id) {
       throw new AppError('Payment does not belong to the expected order', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    if (payment.status === 'failed') {
+      return c.json({ success: false, status: 'FAILED', message: 'Payment has failed' }, 400);
     }
 
     if (payment.status !== 'captured') {
@@ -80,7 +114,11 @@ export const verifyRouter = new Hono().post('/:id/verify', authMiddleware, async
     const result = await markPaidAndEnroll(verifiedPayment, enrollStudentInCourseTransaction);
 
     if (result.effects) {
-      await runPostCommitSideEffects(result.effects);
+      try {
+        await runPostCommitSideEffects(result.effects);
+      } catch (err) {
+        console.error('Fatal error in side effects (should be caught internally):', err);
+      }
     }
 
     return c.json(

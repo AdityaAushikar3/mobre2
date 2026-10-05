@@ -89,6 +89,10 @@ export async function markPaidAndEnroll(
             })
             .where(eq(schema.courseOrder.id, order.id));
 
+          console.error(
+            `[DUPLICATE_PAYMENT] Order ${order.id} was PAID with ${order.razorpayPaymentId}, but received ${payment.id}`
+          );
+
           const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
           return { handled: true, alreadyEnrolled: false, order: updatedOrder };
         }
@@ -108,6 +112,7 @@ export async function markPaidAndEnroll(
             .update(schema.courseOrder)
             .set({
               needsAttention: true,
+              attentionReason: 'DUPLICATE_PAYMENT',
               attentionPaymentIds: updatedPaymentIds,
               updatedAt: new Date().toISOString()
             })
@@ -118,7 +123,39 @@ export async function markPaidAndEnroll(
         }
       }
 
-      // Case C: Normal CREATED order
+      // Case F: SUPERSEDED / attention-locked CREATED order
+      if (
+        order.status === 'CREATED' &&
+        order.needsAttention &&
+        !order.razorpayPaymentId &&
+        order.attentionReason !== 'ENROLLMENT_FAILED'
+      ) {
+        const existingPaymentIds = order.attentionPaymentIds ?? [];
+        const updatedPaymentIds = existingPaymentIds.includes(payment.id)
+          ? existingPaymentIds
+          : [...existingPaymentIds, payment.id];
+
+        await tx
+          .update(schema.courseOrder)
+          .set({
+            razorpayPaymentId: payment.id,
+            attentionPaymentIds: updatedPaymentIds,
+            updatedAt: new Date().toISOString()
+          })
+          .where(eq(schema.courseOrder.id, order.id));
+
+        console.error(
+          `[SUPERSEDED_ORDER_PAYMENT] Payment ${payment.id} received for superseded order ${order.id}. Attention Reason: ${order.attentionReason}`
+        );
+
+        const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
+        return { handled: true, alreadyEnrolled: false, order: updatedOrder };
+      }
+
+      // Case C/E: Normal CREATED order (or ENROLLMENT_FAILED retry)
+      // Note: If order was ENROLLMENT_FAILED, needsAttention is true and razorpayPaymentId is null.
+      // This falls through to here naturally because we excluded attentionReason !== 'ENROLLMENT_FAILED' in Case F.
+
       if (payment.status !== 'captured') {
         throw new AppError('Payment is not captured', ErrorCodes.VALIDATION_ERROR, 400);
       }
@@ -144,31 +181,15 @@ export async function markPaidAndEnroll(
         return { handled: true, alreadyEnrolled: false, order: updatedOrder };
       }
 
-      // Case D: Student is already enrolled
-      const [membership] = await tx
+      // Case D/E: Reconcile and Enroll
+      const [existingMembership] = await tx
         .select()
         .from(schema.groupmember)
         .where(and(eq(schema.groupmember.groupId, course.groupId), eq(schema.groupmember.profileId, order.userId)))
         .limit(1);
 
-      if (membership) {
-        await tx
-          .update(schema.courseOrder)
-          .set({
-            status: 'PAID',
-            razorpayPaymentId: payment.id,
-            paidAt: new Date().toISOString(),
-            needsAttention: true,
-            attentionReason: 'ALREADY_ENROLLED',
-            updatedAt: new Date().toISOString()
-          })
-          .where(eq(schema.courseOrder.id, order.id));
+      const isAlreadyEnrolled = !!existingMembership;
 
-        const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
-        return { handled: true, alreadyEnrolled: true, order: updatedOrder };
-      }
-
-      // Case E: Successful payment and new enrollment
       let effects;
       try {
         effects = await enrollFn(tx, order, course);
@@ -183,14 +204,14 @@ export async function markPaidAndEnroll(
           status: 'PAID',
           razorpayPaymentId: payment.id,
           paidAt: new Date().toISOString(),
-          needsAttention: false,
-          attentionReason: null,
+          needsAttention: isAlreadyEnrolled,
+          attentionReason: isAlreadyEnrolled ? 'ALREADY_ENROLLED' : null,
           updatedAt: new Date().toISOString()
         })
         .where(eq(schema.courseOrder.id, order.id));
 
       const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
-      return { handled: true, alreadyEnrolled: false, order: updatedOrder, effects };
+      return { handled: true, alreadyEnrolled: isAlreadyEnrolled, order: updatedOrder, effects };
     });
   } catch (error) {
     if (error instanceof EnrollmentFailedError && transactionRolledBack) {
