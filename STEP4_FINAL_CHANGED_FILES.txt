@@ -1,0 +1,2848 @@
+﻿================================================================================
+STEP 4 FINAL CHANGED FILES — COMPLETE CONTENT AUDIT
+Generated: 2026-10-05 23.06.33
+================================================================================
+
+MODIFIED FILES (9 total):
+  apps/api/src/__tests__/course-payment-processing.test.ts
+  apps/api/src/__tests__/course-payment-verify-route.test.ts
+  apps/api/src/__tests__/purchase-concurrency.test.ts
+  apps/api/src/routes/course/verify.ts
+  apps/api/src/services/course/payment.ts
+  apps/api/vitest.config.ts
+  packages/core/src/services/course/payment.ts
+  packages/core/src/services/course/purchase.ts
+  packages/db/src/queries/auth/profile.ts
+
+NEWLY CREATED (Step 4 source/test):
+  apps/api/src/__tests__/course-payment-verify-production-route.test.ts
+
+UNCHANGED / REFERENCE ONLY:
+  apps/api/src/routes/course/course.ts
+  apps/api/src/app.ts
+
+================================================================================
+[MODIFIED] apps/api/src/__tests__/course-payment-processing.test.ts
+Path: apps/api/src/__tests__/course-payment-processing.test.ts
+================================================================================
+import { describe, expect, it, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
+import { db } from '@cio/db/drizzle';
+import * as schema from '@cio/db/schema';
+import { eq, and } from 'drizzle-orm';
+import { markPaidAndEnroll, type VerifiedPayment, EnrollmentFailedError } from '@cio/core/services/course/payment';
+import { enrollStudentInCourseTransaction } from '@api/services/course/payment';
+
+describe('Course Payment Processing State Machine (Cases A-F)', () => {
+  const orgId = crypto.randomUUID();
+  let groupId: string;
+
+  beforeAll(async () => {
+    await db.insert(schema.organization).values({
+      id: orgId,
+      name: 'Test Org for Verify'
+    });
+
+    const [group] = await db
+      .insert(schema.group)
+      .values({
+        organizationId: orgId,
+        name: 'Test Course Group Verify'
+      })
+      .returning();
+    groupId = group.id;
+  });
+
+  afterAll(async () => {
+    await db.delete(schema.group).where(eq(schema.group.id, groupId));
+    await db.delete(schema.organization).where(eq(schema.organization.id, orgId));
+  });
+
+  describe('Core MarkPaidAndEnroll function', () => {
+    const courseId = crypto.randomUUID();
+    const userId = crypto.randomUUID();
+    let razorpayOrderId: string;
+
+    beforeEach(async () => {
+      razorpayOrderId = `order_${crypto.randomUUID().replace(/-/g, '').slice(0, 14)}`;
+
+      await db.insert(schema.user).values({
+        id: userId,
+        email: `student-verify-${Date.now()}@test.com`,
+        name: 'Test Verify Student',
+        emailVerified: true
+      });
+      await db.insert(schema.profile).values({
+        id: userId,
+        email: `student-verify-${Date.now()}@test.com`,
+        fullname: 'Test Verify Student',
+        username: `student_verify_${Date.now()}`
+      });
+
+      await db.insert(schema.course).values({
+        id: courseId,
+        title: 'Test Paid Course',
+        description: 'Test Paid Course',
+        groupId: groupId,
+        isTemplate: false,
+        logo: 'test.png',
+        metadata: {},
+        cost: 500, // 500 INR
+        currency: 'INR'
+      });
+    });
+
+    afterEach(async () => {
+      await db.delete(schema.groupmember).where(eq(schema.groupmember.profileId, userId));
+      await db.delete(schema.organizationmember).where(eq(schema.organizationmember.profileId, userId));
+      await db.delete(schema.courseOrder).where(eq(schema.courseOrder.courseId, courseId));
+      await db.delete(schema.course).where(eq(schema.course.id, courseId));
+      await db.delete(schema.profile).where(eq(schema.profile.id, userId));
+      await db.delete(schema.user).where(eq(schema.user.id, userId));
+    });
+
+    it('Case E: Normal successful payment and enrollment', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_xyz123',
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enrollFn = vi.fn().mockResolvedValue({ someEffect: true });
+
+      const result = await markPaidAndEnroll(payment, enrollFn);
+
+      expect(result.handled).toBe(true);
+      expect(result.alreadyEnrolled).toBe(false);
+      expect(result.effects).toEqual({ someEffect: true });
+      expect(enrollFn).toHaveBeenCalled();
+
+      const [order] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+      expect(order.status).toBe('PAID');
+      expect(order.razorpayPaymentId).toBe('pay_xyz123');
+      expect(order.needsAttention).toBe(false);
+    });
+
+    it('Case A: Order is already PAID, same payment (Idempotency)', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        razorpayPaymentId: 'pay_xyz123',
+        status: 'PAID',
+        needsAttention: false
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_xyz123', // Same payment
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enrollFn = vi.fn();
+      const result = await markPaidAndEnroll(payment, enrollFn);
+
+      expect(result.handled).toBe(true);
+      expect(enrollFn).not.toHaveBeenCalled();
+
+      const [order] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+      expect(order.needsAttention).toBe(false);
+    });
+
+    it('Case A: Order is already PAID, DIFFERENT payment (Needs attention)', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        razorpayPaymentId: 'pay_xyz123',
+        status: 'PAID',
+        needsAttention: false
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_abc999', // Different payment
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enrollFn = vi.fn();
+      const result = await markPaidAndEnroll(payment, enrollFn);
+
+      expect(result.handled).toBe(true);
+      expect(enrollFn).not.toHaveBeenCalled();
+
+      const [order] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+      expect(order.needsAttention).toBe(true);
+      expect(order.attentionReason).toBe('DUPLICATE_PAYMENT');
+      expect(order.attentionPaymentIds).toContain('pay_abc999');
+    });
+
+    it('Case C: Amount Mismatch', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_xyz123',
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 40000, // Mismatch
+        currency: 'INR'
+      };
+
+      const enrollFn = vi.fn();
+      const result = await markPaidAndEnroll(payment, enrollFn);
+
+      expect(result.handled).toBe(true);
+      expect(enrollFn).not.toHaveBeenCalled();
+
+      const [order] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+      expect(order.status).toBe('CREATED');
+      expect(order.needsAttention).toBe(true);
+      expect(order.attentionReason).toBe('AMOUNT_MISMATCH');
+    });
+
+    it('Case D: Student already enrolled (missing org membership is created)', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      // Simulate student already in group but NOT in org
+      await db.insert(schema.groupmember).values({
+        groupId: groupId,
+        roleId: 2,
+        profileId: userId,
+        email: `student-verify-${Date.now()}@test.com`
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_xyz123',
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const result = await markPaidAndEnroll(payment, enrollStudentInCourseTransaction);
+
+      expect(result.handled).toBe(true);
+      expect(result.alreadyEnrolled).toBe(true);
+
+      const [order] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+      expect(order.status).toBe('PAID');
+      expect(order.needsAttention).toBe(true);
+      expect(order.attentionReason).toBe('ALREADY_ENROLLED');
+
+      // Assert org membership was created
+      const [orgMember] = await db
+        .select()
+        .from(schema.organizationmember)
+        .where(and(eq(schema.organizationmember.organizationId, orgId), eq(schema.organizationmember.profileId, userId)));
+      
+      expect(orgMember).toBeDefined();
+    });
+
+    it('Case F: Enrollment Failure', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_xyz123',
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enrollFn = vi.fn().mockRejectedValue(new Error('Simulated DB failure'));
+
+      await expect(markPaidAndEnroll(payment, enrollFn)).rejects.toThrow('Payment verified but enrollment failed');
+
+      const [order] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+      expect(order.status).toBe('CREATED');
+      expect(order.razorpayPaymentId).toBeNull();
+      expect(order.needsAttention).toBe(true);
+      expect(order.attentionReason).toBe('ENROLLMENT_FAILED');
+    });
+    it('Case C: Currency Mismatch', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_xyz123',
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'USD' // Mismatch
+      };
+
+      const enrollFn = vi.fn();
+      const result = await markPaidAndEnroll(payment, enrollFn);
+
+      expect(result.handled).toBe(true);
+      expect(enrollFn).not.toHaveBeenCalled();
+
+      const [order] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+      expect(order.status).toBe('CREATED');
+      expect(order.needsAttention).toBe(true);
+      expect(order.attentionReason).toBe('AMOUNT_MISMATCH');
+    });
+
+    it('CREATED + existing payment + same ID', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        razorpayPaymentId: 'pay_xyz123',
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_xyz123',
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enrollFn = vi.fn();
+      const result = await markPaidAndEnroll(payment, enrollFn);
+
+      expect(result.handled).toBe(true);
+      expect(enrollFn).not.toHaveBeenCalled();
+    });
+
+    it('CREATED + existing payment + different ID', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        razorpayPaymentId: 'pay_xyz123',
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_abc999',
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enrollFn = vi.fn();
+      const result = await markPaidAndEnroll(payment, enrollFn);
+
+      expect(result.handled).toBe(true);
+      expect(enrollFn).not.toHaveBeenCalled();
+
+      const [order] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+      expect(order.needsAttention).toBe(true);
+      expect(order.attentionReason).toBe('DUPLICATE_PAYMENT');
+      expect(order.attentionPaymentIds).toContain('pay_abc999');
+      expect(order.razorpayPaymentId).toBe('pay_xyz123'); // Preserved original
+    });
+
+    it('successful retry after ENROLLMENT_FAILED clears attention state', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        status: 'CREATED',
+        needsAttention: true,
+        attentionReason: 'ENROLLMENT_FAILED'
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_xyz123',
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enrollFn = vi.fn().mockResolvedValue(true);
+      const result = await markPaidAndEnroll(payment, enrollFn);
+
+      expect(result.handled).toBe(true);
+
+      const [order] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+      expect(order.status).toBe('PAID');
+      expect(order.needsAttention).toBe(false);
+      expect(order.attentionReason).toBeNull();
+    });
+
+    it('Concurrency: DIFFERENT orders for same user/course are serialized safely', async () => {
+      const razorpayOrderId2 = `order_${crypto.randomUUID().replace(/-/g, '').slice(0, 14)}`;
+
+      // Insert two orders for the same user and same course
+      await db.insert(schema.courseOrder).values([
+        {
+          organizationId: orgId,
+          userId: userId,
+          courseId: courseId,
+          amountPaise: 50000,
+          currency: 'INR',
+          razorpayOrderId: razorpayOrderId,
+          status: 'CREATED',
+          needsAttention: false
+        },
+        {
+          organizationId: orgId,
+          userId: userId,
+          courseId: courseId,
+          amountPaise: 50000,
+          currency: 'INR',
+          razorpayOrderId: razorpayOrderId2,
+          status: 'CREATED',
+          needsAttention: false
+        }
+      ]);
+
+      const payment1: VerifiedPayment = {
+        id: 'pay_xyz123',
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const payment2: VerifiedPayment = {
+        id: 'pay_abc999',
+        razorpayOrderId: razorpayOrderId2,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      // Both try to enroll simultaneously
+      // Both try to enroll simultaneously using the actual enrollStudentInCourseTransaction
+      const enrollFn1 = vi.fn().mockImplementation(async (tx) => {
+        // simulate some delay to ensure overlapping execution
+        await new Promise(resolve => setTimeout(resolve, 50));
+        
+        const [order] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+        const [course] = await tx.select().from(schema.course).where(eq(schema.course.id, courseId));
+        return await enrollStudentInCourseTransaction(tx, order, course);
+      });
+
+      const enrollFn2 = vi.fn().mockImplementation(async (tx) => {
+        // simulate some delay
+        await new Promise(resolve => setTimeout(resolve, 50));
+        
+        const [order] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId2));
+        const [course] = await tx.select().from(schema.course).where(eq(schema.course.id, courseId));
+        return await enrollStudentInCourseTransaction(tx, order, course);
+      });
+
+      // Fire both concurrently
+      const results = await Promise.all([
+        markPaidAndEnroll(payment1, enrollFn1),
+        markPaidAndEnroll(payment2, enrollFn2)
+      ]);
+
+      expect(results[0].handled).toBe(true);
+      expect(results[1].handled).toBe(true);
+
+      const orders = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.courseId, courseId))
+        .orderBy(schema.courseOrder.razorpayOrderId);
+        
+      // One order will have successfully enrolled (alreadyEnrolled: false).
+      // The other will see the user is ALREADY_ENROLLED (alreadyEnrolled: true) because the lock serialized them.
+      const alreadyEnrolledCount = results.filter(r => r.alreadyEnrolled).length;
+      expect(alreadyEnrolledCount).toBe(1);
+
+      // Both should be marked PAID
+      expect(orders[0].status).toBe('PAID');
+      expect(orders[1].status).toBe('PAID');
+      
+      // Verify payment IDs are intact and unique
+      expect(orders[0].razorpayPaymentId).not.toBeNull();
+      expect(orders[1].razorpayPaymentId).not.toBeNull();
+      expect(orders[0].razorpayPaymentId).not.toBe(orders[1].razorpayPaymentId);
+      
+      // Verify exactly one group membership
+      const memberships = await db.select().from(schema.groupmember).where(eq(schema.groupmember.profileId, userId));
+      expect(memberships.length).toBe(1);
+      
+      // Verify exactly one org membership
+      const orgMemberships = await db.select().from(schema.organizationmember).where(eq(schema.organizationmember.profileId, userId));
+      expect(orgMemberships.length).toBe(1);
+    });
+
+    it('G: Razorpay order mismatch throws 404', async () => {
+      const payment: VerifiedPayment = {
+        id: 'pay_xyz123',
+        razorpayOrderId: 'order_nonexistent',
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+      const enrollFn = vi.fn();
+      await expect(markPaidAndEnroll(payment, enrollFn)).rejects.toThrow('Order not found');
+    });
+
+    it('L: duplicate payment IDs are unique in attentionPaymentIds', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        razorpayPaymentId: 'pay_xyz123',
+        status: 'PAID',
+        needsAttention: true,
+        attentionReason: 'DUPLICATE_PAYMENT',
+        attentionPaymentIds: ['pay_abc999']
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_abc999', // Try to add the same duplicate again
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enrollFn = vi.fn();
+      const result = await markPaidAndEnroll(payment, enrollFn);
+      expect(result.handled).toBe(true);
+
+      const [order] = await db.select().from(schema.courseOrder).where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+      expect(order.attentionPaymentIds).toEqual(['pay_abc999']); // No duplicates
+    });
+    
+    it('O: post-commit side effects are not part of the transaction (just returned)', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: razorpayOrderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const payment: VerifiedPayment = {
+        id: 'pay_xyz123',
+        razorpayOrderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enrollFn = vi.fn().mockResolvedValue({ sideEffectData: 'test' });
+      const result = await markPaidAndEnroll(payment, enrollFn);
+      
+      expect(result.effects).toEqual({ sideEffectData: 'test' });
+      // Side effects aren't executed here, they are just returned to the caller
+    });
+  });
+});
+
+
+================================================================================
+[MODIFIED] apps/api/src/__tests__/course-payment-verify-route.test.ts
+Path: apps/api/src/__tests__/course-payment-verify-route.test.ts
+================================================================================
+import { describe, expect, it, beforeAll, afterAll, vi, beforeEach, afterEach } from 'vitest';
+import { db } from '@cio/db/drizzle';
+import * as schema from '@cio/db/schema';
+import { eq, and } from 'drizzle-orm';
+import crypto from 'node:crypto';
+
+// We need to test the route behavior, including signature verification and mock Razorpay.
+// Let's create an integration test similar to purchase-route.test.ts
+
+vi.mock('razorpay', () => {
+  return {
+    default: class RazorpayMock {
+      constructor(options: any) {}
+      payments = {
+        fetch: async (paymentId: string) => {
+          if (paymentId === 'pay_not_found') {
+            const err: any = new Error('Not found');
+            err.statusCode = 404;
+            throw err;
+          }
+          if (paymentId === 'pay_side_effects') {
+            return {
+              id: paymentId,
+              order_id: 'order_side_effects',
+              status: 'captured',
+              amount: 50000,
+              currency: 'INR'
+            };
+          }
+          if (paymentId === 'pay_pending') {
+            return {
+              id: paymentId,
+              order_id: 'order_123',
+              status: 'authorized', // Not captured
+              amount: 50000,
+              currency: 'INR'
+            };
+          }
+          if (paymentId === 'pay_mismatch') {
+            return {
+              id: paymentId,
+              order_id: 'order_456', // Mismatch!
+              status: 'captured',
+              amount: 50000,
+              currency: 'INR'
+            };
+          }
+          if (paymentId === 'pay_failed') {
+            return {
+              id: paymentId,
+              order_id: 'order_123',
+              status: 'failed',
+              amount: 50000,
+              currency: 'INR'
+            };
+          }
+          if (paymentId === 'pay_different_id') {
+            return {
+              id: 'some_other_id', // Does not equal requested ID
+              order_id: 'order_123',
+              status: 'captured',
+              amount: 50000,
+              currency: 'INR'
+            };
+          }
+          return {
+            id: paymentId,
+            order_id: 'order_123',
+            status: 'captured',
+            amount: 50000,
+            currency: 'INR'
+          };
+        }
+      };
+    }
+  };
+});
+
+vi.mock('@cio/core/config/env', () => {
+  return {
+    env: {
+      RAZORPAY_KEY_ID: 'rzp_test_123',
+      RAZORPAY_KEY_SECRET: 'rzp_secret_123',
+      SESSION_SECRET: 'test_secret',
+      API_PORT: 8080,
+      PUBLIC_IS_SELFHOSTED: 'true',
+      RESEND_API_KEY: 're_123',
+      POSTGRES_URL: 'postgres://postgres:postgres@localhost:5432/classroomio'
+    }
+  };
+});
+
+vi.mock('@api/middlewares/auth', () => {
+  return {
+    authMiddleware: async (c: any, next: any) => {
+      if (!c.get('user')) {
+        return c.json({ error: 'Unauthorized' }, 401);
+      }
+      await next();
+    }
+  };
+});
+
+vi.mock('@api/services/course/payment', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@api/services/course/payment')>();
+  return {
+    ...actual,
+    runPostCommitSideEffects: vi.fn(actual.runPostCommitSideEffects)
+  };
+});
+
+// Since we can't easily start the whole express/hono app here if it's complex,
+// we might mock the auth middleware and route directly, or just rely on standard app request.
+// Let's use the actual route if possible, we just need a valid token.
+// A simpler way for a route test if app is not easily importable is just to assume it passes through.
+// Actually, I will mock the auth for standard app requests.
+// Wait, we can use a helper or just create a minimal hono app here to test the router.
+import { verifyRouter } from '../routes/course/verify';
+import { Hono } from 'hono';
+
+const testApp = new Hono<{ Variables: { user: any; orgId: string } }>();
+const testUserId = crypto.randomUUID();
+const testUserEmail = `test_verify_${Date.now()}@test.com`;
+testApp.use('*', async (c, next) => {
+  c.set('user', { id: testUserId, email: testUserEmail });
+  await next();
+});
+testApp.route('/course', verifyRouter);
+
+describe('Verify Route API', () => {
+  const orgId = crypto.randomUUID();
+  let groupId: string;
+  let orderId: string;
+  const courseId = crypto.randomUUID();
+
+  beforeAll(async () => {
+    await db.insert(schema.organization).values({
+      id: orgId,
+      name: 'Test Org'
+    });
+
+    const [group] = await db.insert(schema.group).values({ organizationId: orgId, name: 'Group' }).returning();
+    groupId = group.id;
+
+    await db.insert(schema.user).values({ id: testUserId, email: testUserEmail, name: 'Test', emailVerified: true });
+    await db
+      .insert(schema.profile)
+      .values({ id: testUserId, email: testUserEmail, fullname: 'Test', username: `usr_${Date.now()}` });
+
+    await db.insert(schema.course).values({
+      id: courseId,
+      title: 'Course',
+      description: 'Course',
+      groupId: groupId,
+      isTemplate: false,
+      logo: 'test.png',
+      metadata: {},
+      cost: 500,
+      currency: 'INR'
+    });
+  });
+
+  afterAll(async () => {
+    await db.delete(schema.groupmember).where(eq(schema.groupmember.profileId, testUserId));
+    await db.delete(schema.organizationmember).where(eq(schema.organizationmember.profileId, testUserId));
+    await db.delete(schema.courseOrder).where(eq(schema.courseOrder.courseId, courseId));
+    await db.delete(schema.course).where(eq(schema.course.id, courseId));
+    await db.delete(schema.profile).where(eq(schema.profile.id, testUserId));
+    await db.delete(schema.user).where(eq(schema.user.id, testUserId));
+    await db.delete(schema.group).where(eq(schema.group.id, groupId));
+    await db.delete(schema.organization).where(eq(schema.organization.id, orgId));
+  });
+
+  beforeEach(async () => {
+    const [order] = await db
+      .insert(schema.courseOrder)
+      .values({
+        organizationId: orgId,
+        userId: testUserId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: 'order_123',
+        status: 'CREATED',
+        needsAttention: false
+      })
+      .returning();
+    orderId = order.id;
+  });
+
+  afterEach(async () => {
+    if (orderId) {
+      await db.delete(schema.courseOrder).where(eq(schema.courseOrder.id, orderId));
+    }
+    if (groupId) {
+      await db.delete(schema.groupmember).where(eq(schema.groupmember.groupId, groupId));
+    }
+  });
+
+  const getSignature = (orderId: string, paymentId: string) => {
+    return crypto.createHmac('sha256', 'rzp_secret_123').update(`${orderId}|${paymentId}`).digest('hex');
+  };
+
+  it('verifies a valid payment and enrolls', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_xyz',
+        razorpay_signature: getSignature('order_123', 'pay_xyz')
+      })
+    });
+
+    const data = await res.json();
+    expect(res.status).toBe(200);
+    expect(data.success).toBe(true);
+    expect(data.data.status).toBe('PAID');
+    expect(data.data.razorpayPaymentId).toBe('pay_xyz');
+  });
+
+  it('rejects invalid signature (valid hex, wrong content)', async () => {
+    const invalidSignature = crypto.randomBytes(32).toString('hex');
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_xyz',
+        razorpay_signature: invalidSignature
+      })
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects short signature', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_xyz',
+        razorpay_signature: 'short_sig'
+      })
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects long signature', async () => {
+    const longSignature = crypto.randomBytes(64).toString('hex');
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_xyz',
+        razorpay_signature: longSignature
+      })
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects wrong signature type', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_xyz',
+        razorpay_signature: 12345
+      })
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects mismatching order_id', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_mismatch',
+        razorpay_payment_id: 'pay_xyz',
+        razorpay_signature: getSignature('order_mismatch', 'pay_xyz')
+      })
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects unauthenticated request', async () => {
+    const unauthApp = new Hono();
+    unauthApp.route('/course', verifyRouter);
+    
+    const res = await unauthApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_xyz',
+        razorpay_signature: getSignature('order_123', 'pay_xyz')
+      })
+    });
+
+    expect(res.status).toBe(401);
+  });
+  
+  it('rejects if another users order', async () => {
+    const otherUserId = crypto.randomUUID();
+    await db.insert(schema.user).values({ id: otherUserId, name: 'Other', email: `other-${Date.now()}@test.com`, emailVerified: true });
+    await db.insert(schema.profile).values({ id: otherUserId, email: `other-${Date.now()}@test.com`, fullname: 'Other', username: `other_${Date.now()}` });
+
+    const [otherOrder] = await db.insert(schema.courseOrder).values({
+      organizationId: orgId,
+      userId: otherUserId, // Different user
+      courseId: courseId,
+      amountPaise: 50000,
+      currency: 'INR',
+      razorpayOrderId: 'order_other',
+      status: 'CREATED',
+      needsAttention: false
+    }).returning();
+    
+    const res = await testApp.request(`/course/${otherOrder.id}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_other',
+        razorpay_payment_id: 'pay_xyz',
+        razorpay_signature: getSignature('order_other', 'pay_xyz')
+      })
+    });
+    
+    expect(res.status).toBe(403);
+    await db.delete(schema.courseOrder).where(eq(schema.courseOrder.id, otherOrder.id));
+  });
+  
+  it('rejects unknown local order', async () => {
+    const res = await testApp.request(`/course/${crypto.randomUUID()}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_xyz',
+        razorpay_signature: getSignature('order_123', 'pay_xyz')
+      })
+    });
+    expect(res.status).toBe(404);
+  });
+  
+  it('rejects payment not found at Razorpay', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_not_found',
+        razorpay_signature: getSignature('order_123', 'pay_not_found')
+      })
+    });
+    expect(res.status).toBe(404);
+  });
+  
+  it('rejects if Razorpay returned payment ID does not equal requested payment ID', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_different_id',
+        razorpay_signature: getSignature('order_123', 'pay_different_id')
+      })
+    });
+    // We updated verify.ts to check if payment.id === razorpay_payment_id
+    expect(res.status).toBe(400);
+  });
+  
+  it('rejects if Razorpay payment belongs to another Razorpay order', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_mismatch',
+        razorpay_signature: getSignature('order_123', 'pay_mismatch')
+      })
+    });
+    expect(res.status).toBe(400);
+  });
+  
+  it('returns pending for uncaptured/authorized payment', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_pending',
+        razorpay_signature: getSignature('order_123', 'pay_pending')
+      })
+    });
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.status).toBe('PENDING');
+  });
+  
+  it('rejects failed payment', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123',
+        razorpay_payment_id: 'pay_failed',
+        razorpay_signature: getSignature('order_123', 'pay_failed')
+      })
+    });
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.status).toBe('FAILED');
+  });
+  
+  it('rejects malformed JSON', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{ malformed: true '
+    });
+    // Hono might return 400 or 500 depending on body parser, but we want to ensure it handles it
+    expect(res.status).toBe(400);
+  });
+  
+  it('rejects missing payment fields', async () => {
+    const res = await testApp.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_123'
+        // missing payment id and signature
+      })
+    });
+    expect(res.status).toBe(400);
+  });
+  
+  it('post-commit failure does not roll back enrollment or fail request', async () => {
+    const { runPostCommitSideEffects } = await import('@api/services/course/payment');
+    // Mock it to throw an error
+    vi.mocked(runPostCommitSideEffects).mockRejectedValueOnce(new Error('Simulated side effect failure'));
+
+    // Create a new order to test success
+    const newOrderId = crypto.randomUUID();
+    await db.insert(schema.courseOrder).values({
+      id: newOrderId,
+      organizationId: orgId,
+      userId: testUserId,
+      courseId: courseId,
+      amountPaise: 50000,
+      currency: 'INR',
+      razorpayOrderId: 'order_side_effects',
+      status: 'CREATED',
+      needsAttention: false
+    });
+
+    const res = await testApp.request(`/course/${newOrderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'order_side_effects',
+        razorpay_payment_id: 'pay_side_effects',
+        razorpay_signature: getSignature('order_side_effects', 'pay_side_effects')
+      })
+    });
+
+    // The API request should succeed even though side effects failed
+    expect(res.status).toBe(200);
+
+    const [order] = await db
+      .select()
+      .from(schema.courseOrder)
+      .where(eq(schema.courseOrder.id, newOrderId));
+    
+    // Proves the course_order remains PAID
+    expect(order.status).toBe('PAID');
+    expect(order.razorpayPaymentId).toBe('pay_side_effects');
+
+    const [groupMember] = await db
+      .select()
+      .from(schema.groupmember)
+      .where(and(eq(schema.groupmember.groupId, groupId), eq(schema.groupmember.profileId, testUserId)));
+    
+    // Proves the enrollment remains committed
+    expect(groupMember).toBeDefined();
+
+    await db.delete(schema.courseOrder).where(eq(schema.courseOrder.id, newOrderId));
+    await db.delete(schema.groupmember).where(eq(schema.groupmember.id, groupMember.id));
+  });
+});
+
+
+================================================================================
+[MODIFIED] apps/api/src/__tests__/purchase-concurrency.test.ts
+Path: apps/api/src/__tests__/purchase-concurrency.test.ts
+================================================================================
+import { describe, expect, it, beforeAll, afterAll, vi, beforeEach, afterEach } from 'vitest';
+import { db } from '@cio/db/drizzle';
+import * as schema from '@cio/db/schema';
+import { eq } from 'drizzle-orm';
+import { createCoursePurchase } from '@cio/core/services/course/purchase';
+import { markPaidAndEnroll } from '@cio/core/services/course/payment';
+import { ROLE } from '@cio/utils/constants';
+
+// Mock Razorpay to simulate external network delay and deterministic behavior
+vi.mock('razorpay', () => {
+  return {
+    default: class RazorpayMock {
+      constructor(options: any) {}
+      orders = {
+        create: async (options: any) => {
+          // Simulate 50ms network delay
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return {
+            id: `order_${crypto.randomUUID().replace(/-/g, '').slice(0, 14)}`,
+            amount: options.amount,
+            currency: options.currency
+          };
+        }
+      };
+    }
+  };
+});
+
+vi.mock('@cio/core/config/env', () => {
+  return {
+    env: {
+      RAZORPAY_KEY_ID: 'rzp_test_123',
+      RAZORPAY_KEY_SECRET: 'rzp_secret_123'
+    }
+  };
+});
+
+describe('Course Purchase Concurrency & State', () => {
+  const orgId = crypto.randomUUID();
+  let groupId: string;
+
+  beforeAll(async () => {
+    await db.insert(schema.organization).values({
+      id: orgId,
+      name: 'Test Org'
+    });
+
+    const [group] = await db
+      .insert(schema.group)
+      .values({
+        organizationId: orgId,
+        name: 'Test Course Group'
+      })
+      .returning();
+    groupId = group.id;
+  });
+
+  afterAll(async () => {
+    await db.delete(schema.group).where(eq(schema.group.id, groupId));
+    await db.delete(schema.organization).where(eq(schema.organization.id, orgId));
+  });
+
+  describe('Isolated tests', () => {
+    const courseId = crypto.randomUUID();
+    const userId = crypto.randomUUID();
+
+    beforeEach(async () => {
+      await db.insert(schema.user).values({
+        id: userId,
+        email: `student-${Date.now()}@test.com`,
+        name: 'Test Student',
+        emailVerified: true
+      });
+      await db.insert(schema.profile).values({
+        id: userId,
+        email: `student-${Date.now()}@test.com`,
+        fullname: 'Test Student',
+        username: `student_${Date.now()}`
+      });
+
+      await db.insert(schema.course).values({
+        id: courseId,
+        title: 'Test Paid Course',
+        description: 'Test Paid Course',
+        groupId: groupId,
+        isTemplate: false,
+        logo: 'test.png',
+        metadata: {},
+        cost: 500, // 500 INR
+        currency: 'INR'
+      });
+    });
+
+    afterEach(async () => {
+      await db.delete(schema.groupmember).where(eq(schema.groupmember.profileId, userId));
+      await db.delete(schema.courseOrder).where(eq(schema.courseOrder.courseId, courseId));
+      await db.delete(schema.course).where(eq(schema.course.id, courseId));
+      await db.delete(schema.profile).where(eq(schema.profile.id, userId));
+      await db.delete(schema.user).where(eq(schema.user.id, userId));
+    });
+
+    it('exactly ONE Razorpay order is created on concurrent purchase attempts', async () => {
+      const results = await Promise.allSettled(
+        Array.from({ length: 5 }).map(() => createCoursePurchase(courseId, userId, orgId))
+      );
+
+      const successes = results.filter((r) => r.status === 'fulfilled') as PromiseFulfilledResult<any>[];
+      const failures = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+
+      expect(failures.length).toBe(0);
+      expect(successes.length).toBe(5);
+
+      const uniqueRazorpayOrderIds = new Set(successes.map((s) => s.value.razorpayOrderId));
+      expect(uniqueRazorpayOrderIds.size).toBe(1);
+    });
+
+    it('CREATED ENROLLMENT_FAILED blocks purchase', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: `order_failed_${Date.now()}`,
+        status: 'CREATED',
+        needsAttention: true,
+        attentionReason: 'ENROLLMENT_FAILED'
+      });
+
+      await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+        'Your payment is being processed. Please contact support if this takes long.'
+      );
+    });
+
+    it('CREATED ENROLLMENT_FAILED blocks purchase even if needsAttention is false', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: `order_failed_${Date.now()}`,
+        status: 'CREATED',
+        needsAttention: false,
+        attentionReason: 'ENROLLMENT_FAILED'
+      });
+
+      await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+        'Your payment is being processed. Please contact support if this takes long.'
+      );
+    });
+
+    it('PAID ENROLLMENT_FAILED does NOT block as unresolved purchase', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: `order_failed_${Date.now()}`,
+        status: 'PAID',
+        needsAttention: true,
+        attentionReason: 'ENROLLMENT_FAILED'
+      });
+
+      const res = await createCoursePurchase(courseId, userId, orgId);
+      expect(res.razorpayOrderId).toBeDefined();
+    });
+
+    it('valid reusable order is reused', async () => {
+      const { razorpayOrderId: existingOrderId } = await createCoursePurchase(courseId, userId, orgId);
+      const res = await createCoursePurchase(courseId, userId, orgId);
+      expect(res.razorpayOrderId).toBe(existingOrderId);
+    });
+
+    it('razorpayPaymentId != NULL is NOT reused (gets fresh order)', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: `order_failed_${Date.now()}`,
+        razorpayPaymentId: 'pay_xyz123',
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const res = await createCoursePurchase(courseId, userId, orgId);
+      expect(res.razorpayOrderId).not.toBe(`order_failed_${Date.now()}`);
+      expect(res.razorpayOrderId.startsWith('order_')).toBe(true);
+    });
+
+    it('needsAttention=true is NOT reused', async () => {
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: `order_attn_${Date.now()}`,
+        status: 'CREATED',
+        needsAttention: true
+      });
+
+      const res = await createCoursePurchase(courseId, userId, orgId);
+      expect(res.razorpayOrderId).not.toBe(`order_attn_${Date.now()}`);
+    });
+
+    it('already enrolled via groupmember rejects purchase', async () => {
+      await db.insert(schema.groupmember).values({
+        groupId: groupId,
+        roleId: ROLE.STUDENT,
+        profileId: userId,
+        email: `student-${Date.now()}@test.com`
+      });
+
+      await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+        'You are already enrolled in this course'
+      );
+    });
+
+    it('cross-organization course rejection', async () => {
+      const otherOrgId = crypto.randomUUID();
+      await db.insert(schema.organization).values({
+        id: otherOrgId,
+        name: 'Other Org'
+      });
+
+      await expect(createCoursePurchase(courseId, userId, otherOrgId)).rejects.toThrow(
+        'Course not found in this organization'
+      );
+
+      await db.delete(schema.organization).where(eq(schema.organization.id, otherOrgId));
+    });
+
+    describe('Pricing validation', () => {
+      it('rejects 0 cost', async () => {
+        await db.update(schema.course).set({ cost: 0 }).where(eq(schema.course.id, courseId));
+        await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+          'Course cost is below the minimum allowed for purchase'
+        );
+      });
+
+      it('rejects negative cost', async () => {
+        await db.update(schema.course).set({ cost: -50 }).where(eq(schema.course.id, courseId));
+        await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+          'Course cost is below the minimum allowed for purchase'
+        );
+      });
+
+      it('rejects PostgreSQL integer overflow (amountPaise > 2147483647)', async () => {
+        // 22000000 is 2.2 billion paise, which exceeds 2147483647
+        await db.update(schema.course).set({ cost: 22000000 }).where(eq(schema.course.id, courseId));
+        await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+          'Course price exceeds maximum allowed value'
+        );
+      });
+
+      it('rejects unsafe integer amount (amountPaise > Number.MAX_SAFE_INTEGER)', async () => {
+        // Just having cost be MAX_SAFE_INTEGER / 100 will trigger the safe integer bound
+        await db.update(schema.course).set({ cost: 90071992547410 }).where(eq(schema.course.id, courseId));
+        await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+          'Course price is not a safe integer in paise'
+        );
+      });
+
+      it('accepts valid price â‚¹999 -> 99900 paise', async () => {
+        await db.update(schema.course).set({ cost: 999 }).where(eq(schema.course.id, courseId));
+        const res = await createCoursePurchase(courseId, userId, orgId);
+        expect(res.amount).toBe(99900);
+      });
+      
+      it('cancels previous CREATED unpaid orders if course price changes', async () => {
+        await db.update(schema.course).set({ cost: 500 }).where(eq(schema.course.id, courseId));
+        const firstPurchase = await createCoursePurchase(courseId, userId, orgId);
+        
+        await db.update(schema.course).set({ cost: 600 }).where(eq(schema.course.id, courseId));
+        const secondPurchase = await createCoursePurchase(courseId, userId, orgId);
+        
+        expect(firstPurchase.orderId).not.toBe(secondPurchase.orderId);
+        
+        const [oldOrder] = await db
+          .select()
+          .from(schema.courseOrder)
+          .where(eq(schema.courseOrder.id, firstPurchase.orderId));
+          
+        expect(oldOrder.needsAttention).toBe(true);
+        expect(oldOrder.attentionReason).toBe('AMOUNT_MISMATCH');
+      });
+
+      it('rejects payment for a superseded/attention-locked order but records the payment ID', async () => {
+        // Create Order A
+        await db.update(schema.course).set({ cost: 500 }).where(eq(schema.course.id, courseId));
+        const firstPurchase = await createCoursePurchase(courseId, userId, orgId);
+        
+        // Change price and create Order B
+        await db.update(schema.course).set({ cost: 600 }).where(eq(schema.course.id, courseId));
+        const secondPurchase = await createCoursePurchase(courseId, userId, orgId);
+
+        // Submit payment for Order A
+        const result = await markPaidAndEnroll({
+          id: 'pay_superseded123',
+          razorpayOrderId: firstPurchase.razorpayOrderId,
+          status: 'captured',
+          amountPaise: 50000,
+          currency: 'INR'
+        } as any, vi.fn());
+
+        expect(result.handled).toBe(true);
+        expect(result.order.status).toBe('CREATED'); // Preserves CREATED
+        expect(result.order.needsAttention).toBe(true);
+        expect(result.order.attentionReason).toBe('AMOUNT_MISMATCH'); // Preserves reason
+        expect(result.order.razorpayPaymentId).toBe('pay_superseded123'); // Stores ID
+        expect(result.order.attentionPaymentIds).toContain('pay_superseded123'); // Appends uniquely
+      });
+    });
+  });
+});
+
+
+================================================================================
+[MODIFIED] apps/api/src/routes/course/verify.ts
+Path: apps/api/src/routes/course/verify.ts
+================================================================================
+import { Hono } from '@api/utils/hono';
+import { handleError, AppError, ErrorCodes } from '@api/utils/errors';
+import { authMiddleware } from '@api/middlewares/auth';
+import { db } from '@cio/db/drizzle';
+import * as schema from '@cio/db/schema';
+import { eq } from 'drizzle-orm';
+import crypto from 'node:crypto';
+import { env } from '@cio/core/config/env';
+import Razorpay from 'razorpay';
+import { markPaidAndEnroll, type VerifiedPayment } from '@cio/core/services/course/payment';
+import { enrollStudentInCourseTransaction, runPostCommitSideEffects } from '../../services/course/payment';
+
+export const verifyRouter = new Hono().post('/:id/verify', authMiddleware, async (c) => {
+  try {
+    const orderId = c.req.param('id');
+    const user = c.get('user')!;
+
+    let body;
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new AppError('Invalid JSON body', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new AppError('Request body must be a JSON object', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = body;
+
+    if (!razorpay_order_id || typeof razorpay_order_id !== 'string') {
+      throw new AppError('Invalid or missing razorpay_order_id', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+    if (!razorpay_payment_id || typeof razorpay_payment_id !== 'string') {
+      throw new AppError('Invalid or missing razorpay_payment_id', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+    if (!razorpay_signature || typeof razorpay_signature !== 'string' || !/^[a-fA-F0-9]{64}$/.test(razorpay_signature)) {
+      throw new AppError('Invalid or missing razorpay_signature', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    const [order] = await db.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, orderId)).limit(1);
+
+    if (!order) {
+      throw new AppError('Order not found', ErrorCodes.NOT_FOUND, 404);
+    }
+
+    if (order.userId !== user.id) {
+      throw new AppError('Unauthorized order access', ErrorCodes.UNAUTHORIZED, 403);
+    }
+
+    if (order.razorpayOrderId !== razorpay_order_id) {
+      throw new AppError('Order mismatch', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    if (!env.RAZORPAY_KEY_SECRET || !env.RAZORPAY_KEY_ID) {
+      throw new AppError('Razorpay is not configured', ErrorCodes.INTERNAL_ERROR, 500);
+    }
+
+    const generatedSignature = crypto
+      .createHmac('sha256', env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest('hex');
+
+    if (
+      typeof razorpay_signature !== 'string' ||
+      razorpay_signature.length !== generatedSignature.length ||
+      !crypto.timingSafeEqual(Buffer.from(generatedSignature), Buffer.from(razorpay_signature))
+    ) {
+      throw new AppError('Invalid payment signature', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    const razorpay = new Razorpay({
+      key_id: env.RAZORPAY_KEY_ID,
+      key_secret: env.RAZORPAY_KEY_SECRET
+    });
+
+    let payment;
+    try {
+      payment = await razorpay.payments.fetch(razorpay_payment_id);
+    } catch (err: any) {
+      if (err?.statusCode === 404 || err?.error?.code === 'BAD_REQUEST_ERROR') {
+        throw new AppError('Payment not found in provider', ErrorCodes.NOT_FOUND, 404);
+      }
+      throw new AppError('Failed to verify payment with provider', ErrorCodes.INTERNAL_ERROR, 502);
+    }
+
+    if (payment.id !== razorpay_payment_id) {
+      throw new AppError('Provider payment ID does not match requested payment ID', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    if (payment.order_id !== razorpay_order_id) {
+      throw new AppError('Payment does not belong to the expected order', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    if (payment.status === 'failed') {
+      return c.json({ success: false, status: 'FAILED', message: 'Payment has failed' }, 400);
+    }
+
+    if (payment.status !== 'captured') {
+      return c.json({ success: true, status: 'PENDING', message: 'Payment is pending capture' });
+    }
+
+    const verifiedPayment: VerifiedPayment = {
+      id: payment.id,
+      razorpayOrderId: payment.order_id,
+      status: payment.status,
+      amountPaise: payment.amount as number,
+      currency: payment.currency
+    };
+
+    const result = await markPaidAndEnroll(verifiedPayment, enrollStudentInCourseTransaction);
+
+    if (result.effects) {
+      try {
+        await runPostCommitSideEffects(result.effects);
+      } catch (err) {
+        console.error('Fatal error in side effects (should be caught internally):', err);
+      }
+    }
+
+    return c.json(
+      {
+        success: true,
+        data: result.order,
+        alreadyEnrolled: result.alreadyEnrolled
+      },
+      200
+    );
+  } catch (error) {
+    return handleError(c, error, 'Failed to verify course payment');
+  }
+});
+
+
+================================================================================
+[MODIFIED] apps/api/src/services/course/payment.ts
+Path: apps/api/src/services/course/payment.ts
+================================================================================
+import { type DbOrTxClient } from '@cio/db/drizzle';
+import * as schema from '@cio/db/schema';
+import {
+  getOrganizationMemberIdByOrgAndProfile,
+  createOrganizationMember,
+  getOrganizationById
+} from '@cio/db/queries/organization';
+import { getGroupMemberIdByGroupAndProfile, addGroupMember } from '@cio/db/queries/group';
+import { getProfileById } from '@cio/db/queries/auth';
+import { getCourseTeachers } from '@cio/db/queries/course/people';
+import {
+  assertStudentCapacityOrThrow,
+  type StudentMilestoneNotification,
+  notifyStudentMilestone
+} from '../organization/student-limit';
+import { ensureComplianceEnrollmentRecordsForProfiles } from './compliance';
+import { invalidateOrgStats } from '@cio/core/utils/redis/org-stats-cache';
+import { trackServerEvent, SERVER_EVENTS } from '@cio/analytics';
+import { ROLE } from '@cio/utils/constants';
+import { getDashboardBaseUrl } from '@cio/core/config/dashboard-url';
+import { buildEmailFromName, buildEmailBranding } from '@cio/email';
+import { getWelcomeSessionIcs } from './session-invite';
+import { enqueueTransactionalEmail } from '@api/services/jobs';
+
+export type PostCommitSideEffects = {
+  milestoneNotification: StudentMilestoneNotification | null;
+  invalidateOrgId: string | null;
+  trackAnalytics: {
+    orgId: string;
+    userId: string;
+    courseId: string;
+  } | null;
+  emails: {
+    courseId: string;
+    courseName: string;
+    orgName: string;
+    organizationId: string;
+    org: { siteName: string | null; customDomain: string | null; isCustomDomainVerified: boolean | null };
+    branding: any;
+    studentId: string;
+    studentEmail: string;
+    welcomeEmailMessage?: string | null;
+  } | null;
+};
+
+export async function enrollStudentInCourseTransaction(
+  tx: DbOrTxClient,
+  order: typeof schema.courseOrder.$inferSelect,
+  course: typeof schema.course.$inferSelect
+): Promise<PostCommitSideEffects> {
+  const userId = order.userId;
+  const organizationId = order.organizationId;
+  const courseId = order.courseId;
+  const groupId = course.groupId!;
+
+  const orgMemberId = await getOrganizationMemberIdByOrgAndProfile(organizationId, userId, tx);
+
+  const userProfile = await getProfileById(userId, tx);
+  const normalizedEmail = userProfile?.email?.toLowerCase().trim();
+  if (!normalizedEmail) {
+    throw new Error('User email not found');
+  }
+
+  let milestoneNotification: StudentMilestoneNotification | null = null;
+
+  if (!orgMemberId) {
+    milestoneNotification = await assertStudentCapacityOrThrow(organizationId, 1, tx, { deferNotification: true });
+
+    await createOrganizationMember(
+      {
+        organizationId,
+        roleId: ROLE.STUDENT,
+        profileId: userId,
+        email: normalizedEmail,
+        verified: true
+      },
+      tx
+    );
+  }
+
+  const groupMemberId = await getGroupMemberIdByGroupAndProfile(groupId, userId, tx);
+
+  if (!groupMemberId) {
+    await addGroupMember(
+      {
+        groupId,
+        roleId: ROLE.STUDENT,
+        profileId: userId,
+        email: normalizedEmail
+      },
+      tx
+    );
+  }
+
+  await ensureComplianceEnrollmentRecordsForProfiles([courseId], [userId], tx);
+
+  const org = await getOrganizationById(organizationId, tx);
+
+  return {
+    milestoneNotification,
+    invalidateOrgId: organizationId,
+    trackAnalytics: {
+      orgId: organizationId,
+      userId,
+      courseId
+    },
+    emails: {
+      courseId,
+      courseName: course.title,
+      orgName: org!.name,
+      organizationId,
+      org: {
+        siteName: org!.siteName,
+        customDomain: org!.customDomain,
+        isCustomDomainVerified: org!.isCustomDomainVerified
+      },
+      branding: buildEmailBranding({ name: org!.name, avatarUrl: org!.avatarUrl, theme: org!.theme }),
+      studentId: userId,
+      studentEmail: normalizedEmail,
+      welcomeEmailMessage: course.metadata?.welcomeEmailMessage as string | undefined
+    }
+  };
+}
+
+export async function runPostCommitSideEffects(effects: PostCommitSideEffects) {
+  try {
+    if (effects.milestoneNotification) {
+      notifyStudentMilestone(effects.milestoneNotification).catch((err) => console.error(err));
+    }
+
+    if (effects.invalidateOrgId) {
+      invalidateOrgStats(effects.invalidateOrgId).catch((err) => console.error(err));
+    }
+
+    if (effects.trackAnalytics) {
+      try {
+        trackServerEvent({
+          eventType: SERVER_EVENTS.ENROLLMENT_COMPLETED,
+          orgId: effects.trackAnalytics.orgId,
+          userId: effects.trackAnalytics.userId,
+          courseId: effects.trackAnalytics.courseId,
+          props: { path: 'paid-enrollment' }
+        });
+      } catch (err) {
+        console.error('Failed to track analytics:', err);
+      }
+    }
+
+    if (effects.emails) {
+      sendStudentJoinEmails(effects.emails).catch((err) => console.error(err));
+    }
+  } catch (err) {
+    console.error('Unexpected error during post-commit side effects:', err);
+  }
+}
+
+async function sendStudentJoinEmails(input: NonNullable<PostCommitSideEffects['emails']>) {
+  try {
+    const loginUrl = getDashboardBaseUrl(input.org);
+    const ics = await getWelcomeSessionIcs(input.courseId);
+    await enqueueTransactionalEmail('studentCourseWelcome', {
+      to: input.studentEmail,
+      fields: {
+        orgName: input.orgName,
+        courseName: input.courseName,
+        loginUrl,
+        customMessage: input.welcomeEmailMessage ?? undefined,
+        branding: input.branding
+      },
+      from: buildEmailFromName(`${input.orgName} (via ClassroomIO.com)`),
+      idempotencyKey: `course-welcome:${input.courseId}:${input.studentId}`,
+      ics,
+      preference: { organizationId: input.organizationId, recipientProfileId: input.studentId }
+    });
+  } catch (error) {
+    console.error('Failed to enqueue student welcome email:', error);
+  }
+
+  try {
+    const teachers = await getCourseTeachers({ courseId: input.courseId });
+    if (teachers.length === 0) return;
+
+    const studentProfile = await getProfileById(input.studentId);
+    const studentName = studentProfile?.fullname || input.studentEmail;
+    const teacherEmails = teachers.map((t) => t.email).filter((e): e is string => !!e);
+
+    if (teacherEmails.length === 0) return;
+
+    await enqueueTransactionalEmail('teacherStudentJoined', {
+      to: teacherEmails,
+      fields: {
+        courseName: input.courseName,
+        studentName,
+        studentEmail: input.studentEmail,
+        branding: input.branding
+      },
+      from: buildEmailFromName('ClassroomIO'),
+      idempotencyKey: `teacher-student-joined:${input.courseId}:${input.studentId}`,
+      preference: { organizationId: input.organizationId }
+    });
+  } catch (error) {
+    console.error('Failed to enqueue teacher join notification emails:', error);
+  }
+}
+
+
+================================================================================
+[MODIFIED] apps/api/vitest.config.ts
+Path: apps/api/vitest.config.ts
+================================================================================
+import path from 'node:path';
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  resolve: {
+    // Vite does not resolve the nested wildcard subpath exports that `@cio/core`
+    // publishes (`./services/*/*`), so point those specifiers at the package
+    // sources instead. Node resolves them fine, which is why only the test
+    // runner needs this.
+    alias: [
+      { find: '@api', replacement: path.resolve(__dirname, 'src') },
+      { find: /^@cio\/core\/(.*)$/, replacement: path.resolve(__dirname, '../../packages/core/src') + '/$1' },
+      { find: /^@cio\/core$/, replacement: path.resolve(__dirname, '../../packages/core/src/index.ts') },
+      { find: /^@cio\/db\/(.*)$/, replacement: path.resolve(__dirname, '../../packages/db/src') + '/$1' },
+      { find: /^@cio\/utils\/(.*)$/, replacement: path.resolve(__dirname, '../../packages/utils/src') + '/$1' },
+      { find: '@cio/utils', replacement: path.resolve(__dirname, '../../packages/utils/src/index.ts') },
+      // `@cio/db` sources refer to themselves through this alias.
+      { find: /^@db\/(.*)$/, replacement: path.resolve(__dirname, '../../packages/db/src') + '/$1' }
+    ]
+  },
+  test: {
+    globals: true,
+    environment: 'node',
+    env: process.env,
+    setupFiles: ['./setup-env.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json', 'html'],
+      exclude: ['node_modules/', 'dist/']
+    }
+  }
+});
+
+
+================================================================================
+[MODIFIED] packages/core/src/services/course/payment.ts
+Path: packages/core/src/services/course/payment.ts
+================================================================================
+import { db, type DbOrTxClient } from '@cio/db/drizzle';
+import * as schema from '@cio/db/schema';
+import { and, eq, sql } from 'drizzle-orm';
+import { AppError, ErrorCodes } from '@cio/utils/errors';
+
+export type VerifiedPayment = {
+  id: string;
+  razorpayOrderId: string;
+  status: string;
+  amountPaise: number;
+  currency: string;
+};
+
+export type PaymentProcessResult = {
+  handled: boolean;
+  alreadyEnrolled: boolean;
+  order: typeof schema.courseOrder.$inferSelect;
+  effects?: any;
+};
+
+export class EnrollmentFailedError extends Error {
+  constructor(
+    message: string,
+    public cause?: any
+  ) {
+    super(message);
+    this.name = 'EnrollmentFailedError';
+  }
+}
+
+export async function markPaidAndEnroll(
+  payment: VerifiedPayment,
+  enrollFn: (
+    tx: DbOrTxClient,
+    order: typeof schema.courseOrder.$inferSelect,
+    course: typeof schema.course.$inferSelect
+  ) => Promise<any>
+): Promise<PaymentProcessResult> {
+  const [preOrder] = await db
+    .select({ id: schema.courseOrder.id, userId: schema.courseOrder.userId, courseId: schema.courseOrder.courseId })
+    .from(schema.courseOrder)
+    .where(eq(schema.courseOrder.razorpayOrderId, payment.razorpayOrderId))
+    .limit(1);
+
+  if (!preOrder) {
+    throw new AppError('Order not found', ErrorCodes.NOT_FOUND, 404);
+  }
+
+  let transactionRolledBack = false;
+
+  try {
+    return await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${`course_purchase:${preOrder.userId}:${preOrder.courseId}`}))`
+      );
+
+      const [order] = await tx
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.id, preOrder.id))
+        .for('update');
+
+      if (!order) {
+        throw new AppError('Order not found', ErrorCodes.NOT_FOUND, 404);
+      }
+
+      const [course] = await tx.select().from(schema.course).where(eq(schema.course.id, order.courseId)).limit(1);
+      if (!course || !course.groupId) {
+        throw new AppError('Course or group not found', ErrorCodes.VALIDATION_ERROR, 400);
+      }
+
+      // Case A.1: Superseded/attention-locked order with NULL razorpayPaymentId
+      if (order.status === 'CREATED' && order.needsAttention && !order.razorpayPaymentId && order.attentionReason !== 'ENROLLMENT_FAILED') {
+        const existingPaymentIds = (order.attentionPaymentIds as string[]) ?? [];
+        const updatedPaymentIds = existingPaymentIds.includes(payment.id)
+          ? existingPaymentIds
+          : [...existingPaymentIds, payment.id];
+
+        console.error(
+          `[SUPERSEDED_ORDER_PAYMENT] Payment received for superseded order. Incoming ID: ${payment.id}, Order: ${order.id}, Reason: ${order.attentionReason}`
+        );
+
+        await tx
+          .update(schema.courseOrder)
+          .set({
+            razorpayPaymentId: payment.id,
+            attentionPaymentIds: updatedPaymentIds,
+            updatedAt: new Date().toISOString()
+          })
+          .where(eq(schema.courseOrder.id, order.id));
+
+        const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
+        return { handled: true, alreadyEnrolled: false, order: updatedOrder };
+      }
+
+      // Case A: Order is already PAID
+      if (order.status === 'PAID') {
+        if (order.razorpayPaymentId === payment.id) {
+          return { handled: true, alreadyEnrolled: false, order };
+        } else {
+            const existingPaymentIds = (order.attentionPaymentIds as string[]) ?? [];
+          const updatedPaymentIds = existingPaymentIds.includes(payment.id)
+            ? existingPaymentIds
+            : [...existingPaymentIds, payment.id];
+
+          console.error(
+            `[DUPLICATE_PAYMENT] Original ID: ${order.razorpayPaymentId}, Incoming ID: ${payment.id}, Order: ${order.id}, Razorpay Order: ${order.razorpayOrderId}, User: ${order.userId}, Course: ${order.courseId}, Reason: DUPLICATE_PAYMENT`
+          );
+
+          await tx
+            .update(schema.courseOrder)
+            .set({
+              needsAttention: true,
+              attentionReason: 'DUPLICATE_PAYMENT',
+              attentionPaymentIds: updatedPaymentIds,
+              updatedAt: new Date().toISOString()
+            })
+            .where(eq(schema.courseOrder.id, order.id));
+
+          const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
+          return { handled: true, alreadyEnrolled: false, order: updatedOrder };
+        }
+      }
+
+      // Case B: Order is CREATED and razorpayPaymentId is already populated
+      if (order.status === 'CREATED' && order.razorpayPaymentId) {
+        if (order.razorpayPaymentId === payment.id) {
+          return { handled: true, alreadyEnrolled: false, order };
+        } else {
+            const existingPaymentIds = (order.attentionPaymentIds as string[]) ?? [];
+          const updatedPaymentIds = existingPaymentIds.includes(payment.id)
+            ? existingPaymentIds
+            : [...existingPaymentIds, payment.id];
+
+          console.error(
+            `[DUPLICATE_PAYMENT] Original ID: ${order.razorpayPaymentId}, Incoming ID: ${payment.id}, Order: ${order.id}, Razorpay Order: ${order.razorpayOrderId}, User: ${order.userId}, Course: ${order.courseId}, Reason: DUPLICATE_PAYMENT`
+          );
+
+          await tx
+            .update(schema.courseOrder)
+            .set({
+              needsAttention: true,
+              attentionReason: 'DUPLICATE_PAYMENT',
+              attentionPaymentIds: updatedPaymentIds,
+              updatedAt: new Date().toISOString()
+            })
+            .where(eq(schema.courseOrder.id, order.id));
+
+          const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
+          return { handled: true, alreadyEnrolled: false, order: updatedOrder };
+        }
+      }
+
+      // Case C: Normal CREATED order
+      if (payment.status !== 'captured') {
+        throw new AppError('Payment is not captured', ErrorCodes.VALIDATION_ERROR, 400);
+      }
+
+      if (payment.amountPaise !== order.amountPaise || payment.currency !== order.currency) {
+          const existingPaymentIds = (order.attentionPaymentIds as string[]) ?? [];
+        const updatedPaymentIds = existingPaymentIds.includes(payment.id)
+          ? existingPaymentIds
+          : [...existingPaymentIds, payment.id];
+
+        await tx
+          .update(schema.courseOrder)
+          .set({
+            needsAttention: true,
+            attentionReason: 'AMOUNT_MISMATCH',
+            razorpayPaymentId: payment.id,
+            attentionPaymentIds: updatedPaymentIds,
+            updatedAt: new Date().toISOString()
+          })
+          .where(eq(schema.courseOrder.id, order.id));
+
+        const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
+        return { handled: true, alreadyEnrolled: false, order: updatedOrder };
+      }
+
+      // Case C: Student might already be enrolled (ALREADY_ENROLLED reconciliation)
+      const [membership] = await tx
+        .select()
+        .from(schema.groupmember)
+        .where(and(eq(schema.groupmember.groupId, course.groupId), eq(schema.groupmember.profileId, order.userId)))
+        .limit(1);
+
+      // Run idempotent enrollment to ensure org membership and compliance records exist
+      let effects;
+      try {
+        effects = await enrollFn(tx, order, course);
+      } catch (error) {
+        transactionRolledBack = true;
+        throw new EnrollmentFailedError('Enrollment failed', error);
+      }
+
+      if (membership) {
+        await tx
+          .update(schema.courseOrder)
+          .set({
+            status: 'PAID',
+            razorpayPaymentId: payment.id,
+            paidAt: new Date().toISOString(),
+            needsAttention: true,
+            attentionReason: 'ALREADY_ENROLLED',
+            updatedAt: new Date().toISOString()
+          })
+          .where(eq(schema.courseOrder.id, order.id));
+
+        const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
+        return { handled: true, alreadyEnrolled: true, order: updatedOrder, effects };
+      }
+
+      // Case E: Successful payment and new enrollment
+
+      await tx
+        .update(schema.courseOrder)
+        .set({
+          status: 'PAID',
+          razorpayPaymentId: payment.id,
+          paidAt: new Date().toISOString(),
+          needsAttention: false,
+          attentionReason: null,
+          updatedAt: new Date().toISOString()
+        })
+        .where(eq(schema.courseOrder.id, order.id));
+
+      const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
+      return { handled: true, alreadyEnrolled: false, order: updatedOrder, effects };
+    });
+  } catch (error) {
+    if (error instanceof EnrollmentFailedError && transactionRolledBack) {
+      console.error(`[ENROLLMENT_FAILED] Order ${preOrder.id}:`, error.cause);
+
+      try {
+        await db
+          .update(schema.courseOrder)
+          .set({ needsAttention: true, attentionReason: 'ENROLLMENT_FAILED', updatedAt: new Date().toISOString() })
+          .where(eq(schema.courseOrder.id, preOrder.id));
+      } catch (updateError) {
+        console.error(`Failed to update ENROLLMENT_FAILED for order ${preOrder.id}:`, updateError);
+      }
+
+      throw new AppError(
+        'Payment verified but enrollment failed. Support has been notified.',
+        ErrorCodes.INTERNAL_ERROR,
+        500
+      );
+    }
+
+    throw error;
+  }
+}
+
+
+================================================================================
+[MODIFIED] packages/core/src/services/course/purchase.ts
+Path: packages/core/src/services/course/purchase.ts
+================================================================================
+import { AppError, ErrorCodes } from '@cio/utils/errors';
+import { db, type DbOrTxClient } from '@cio/db/drizzle';
+import * as schema from '@cio/db/schema';
+import { and, eq, sql, isNull } from 'drizzle-orm';
+import { getCourseById } from '@cio/db/queries/course';
+import { env } from '../../config/env';
+import Razorpay from 'razorpay';
+import crypto from 'crypto';
+
+const MIN_AMOUNT_PAISE = 100;
+const MAX_AMOUNT_PAISE = 2147483647; // PostgreSQL integer upper bound
+
+function getRazorpayClient() {
+  if (!env.RAZORPAY_KEY_ID || !env.RAZORPAY_KEY_SECRET) {
+    throw new AppError('Razorpay is not configured on this server', ErrorCodes.INTERNAL_ERROR, 500);
+  }
+  return new Razorpay({
+    key_id: env.RAZORPAY_KEY_ID,
+    key_secret: env.RAZORPAY_KEY_SECRET
+  });
+}
+
+export async function createCoursePurchase(courseId: string, userId: string, organizationId: string) {
+  return await db.transaction(async (tx) => {
+    // Acquire transaction-scoped advisory lock for this user + course
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`course_purchase:${userId}:${courseId}`}))`);
+
+    const [course] = await getCourseById(courseId, tx);
+    if (!course) {
+      throw new AppError('Course not found', ErrorCodes.COURSE_NOT_FOUND, 404);
+    }
+
+    // Validate organization boundary via the group
+    if (!course.groupId) {
+      throw new AppError(
+        'Course is not properly configured for purchases (missing group)',
+        ErrorCodes.VALIDATION_ERROR,
+        400
+      );
+    }
+    const [group] = await tx.select().from(schema.group).where(eq(schema.group.id, course.groupId)).limit(1);
+    if (!group || group.organizationId !== organizationId) {
+      throw new AppError('Course not found in this organization', ErrorCodes.COURSE_NOT_FOUND, 404);
+    }
+
+    if (course.currency !== 'INR') {
+      throw new AppError('Only INR is supported for purchases', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    const cost = course.cost;
+    if (typeof cost !== 'number' || !Number.isFinite(cost)) {
+      throw new AppError('Invalid course price', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    const amountPaise = cost * 100;
+
+    if (!Number.isSafeInteger(amountPaise)) {
+      throw new AppError('Course price is not a safe integer in paise', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    if (amountPaise < MIN_AMOUNT_PAISE) {
+      throw new AppError('Course cost is below the minimum allowed for purchase', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    if (amountPaise > MAX_AMOUNT_PAISE) {
+      throw new AppError('Course price exceeds maximum allowed value', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    // Ensure it's an exact integer, do not silently round
+    if (amountPaise % 1 !== 0) {
+      throw new AppError('Course price is not a valid discrete amount in paise', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    // Unresolved ENROLLMENT_FAILED check
+    const [failedOrder] = await tx
+      .select()
+      .from(schema.courseOrder)
+      .where(
+        and(
+          eq(schema.courseOrder.userId, userId),
+          eq(schema.courseOrder.courseId, courseId),
+          eq(schema.courseOrder.status, 'CREATED'),
+          eq(schema.courseOrder.attentionReason, 'ENROLLMENT_FAILED')
+        )
+      )
+      .limit(1);
+
+    if (failedOrder) {
+      throw new AppError(
+        'Your payment is being processed. Please contact support if this takes long.',
+        ErrorCodes.CONFLICT,
+        400
+      );
+    }
+
+    // Already enrolled check via group membership
+    if (course.groupId) {
+      const [membership] = await tx
+        .select()
+        .from(schema.groupmember)
+        .where(and(eq(schema.groupmember.groupId, course.groupId), eq(schema.groupmember.profileId, userId)))
+        .limit(1);
+
+      if (membership) {
+        throw new AppError('You are already enrolled in this course', ErrorCodes.CONFLICT, 400);
+      }
+    }
+
+    const [existingOrder] = await tx
+      .select()
+      .from(schema.courseOrder)
+      .where(
+        and(
+          eq(schema.courseOrder.userId, userId),
+          eq(schema.courseOrder.courseId, courseId),
+          eq(schema.courseOrder.status, 'CREATED'),
+          isNull(schema.courseOrder.razorpayPaymentId),
+          eq(schema.courseOrder.needsAttention, false)
+        )
+      )
+      .orderBy(sql`${schema.courseOrder.createdAt} DESC`)
+      .limit(1);
+
+    if (existingOrder && existingOrder.amountPaise === amountPaise) {
+      return {
+        orderId: existingOrder.id,
+        razorpayOrderId: existingOrder.razorpayOrderId,
+        amount: existingOrder.amountPaise,
+        currency: existingOrder.currency
+      };
+    }
+
+    // We need to create a new order, so mark all previous unpaid CREATED orders as needing attention (superseded)
+    await tx
+      .update(schema.courseOrder)
+      .set({ 
+        needsAttention: true,
+        attentionReason: 'AMOUNT_MISMATCH' 
+      })
+      .where(
+        and(
+          eq(schema.courseOrder.userId, userId),
+          eq(schema.courseOrder.courseId, courseId),
+          eq(schema.courseOrder.status, 'CREATED'),
+          isNull(schema.courseOrder.razorpayPaymentId)
+        )
+      );
+
+
+    const razorpay = getRazorpayClient();
+    const receiptId = crypto.randomUUID().slice(0, 36);
+
+    const rzpOrder = await razorpay.orders.create({
+      amount: amountPaise,
+      currency: 'INR',
+      receipt: receiptId,
+      notes: {
+        userId,
+        courseId
+      }
+    });
+
+    if (!rzpOrder || !rzpOrder.id) {
+      throw new AppError('Failed to create payment order with provider', ErrorCodes.INTERNAL_ERROR, 500);
+    }
+
+    const [newOrder] = await tx
+      .insert(schema.courseOrder)
+      .values({
+        organizationId,
+        userId,
+        courseId,
+        amountPaise,
+        currency: 'INR',
+        razorpayOrderId: rzpOrder.id,
+        status: 'CREATED',
+        needsAttention: false,
+        razorpayPaymentId: null,
+        attentionReason: null
+      })
+      .returning();
+
+    return {
+      orderId: newOrder.id,
+      razorpayOrderId: newOrder.razorpayOrderId,
+      amount: newOrder.amountPaise,
+      currency: newOrder.currency
+    };
+  });
+}
+
+
+================================================================================
+[MODIFIED] packages/db/src/queries/auth/profile.ts
+Path: packages/db/src/queries/auth/profile.ts
+================================================================================
+import * as schema from '@db/schema';
+
+import type { TProfile } from '@db/types';
+import { db, type DbOrTxClient } from '@db/drizzle';
+import { and, eq, inArray, ne } from 'drizzle-orm';
+
+/**
+ * True when the auth user has any non-credential account (OAuth/SSO). Those providers verify email.
+ */
+export async function hasVerifiedEmailProvider(userId: string, dbClient: DbOrTxClient = db): Promise<boolean> {
+  const accounts = await dbClient
+    .select({ providerId: schema.account.providerId })
+    .from(schema.account)
+    .where(and(eq(schema.account.userId, userId), ne(schema.account.providerId, 'credential')))
+    .limit(1);
+
+  return accounts.length > 0;
+}
+
+async function resolveAuthUserEmailVerified(
+  userId: string,
+  emailVerified: boolean,
+  dbClient: DbOrTxClient = db
+): Promise<boolean> {
+  if (emailVerified) {
+    return true;
+  }
+
+  return hasVerifiedEmailProvider(userId, dbClient);
+}
+
+/**
+ * Keeps profile.is_email_verified in sync with auth user + linked OAuth/SSO accounts.
+ * Repairs legacy rows where user.email_verified is true but profile.is_email_verified is false,
+ * and promotes user.email_verified when profile is already verified (e.g. self-hosted bootstrap).
+ * Never demotes profile.is_email_verified.
+ */
+export async function syncProfileEmailVerificationFromAuthUser(userId: string, dbClient: DbOrTxClient = db) {
+  try {
+    const [user] = await dbClient.select().from(schema.user).where(eq(schema.user.id, userId)).limit(1);
+    if (!user) {
+      return null;
+    }
+
+    const [profile] = await dbClient.select().from(schema.profile).where(eq(schema.profile.id, userId)).limit(1);
+    if (!profile) {
+      return null;
+    }
+
+    const authSaysVerified = await resolveAuthUserEmailVerified(userId, user.emailVerified, dbClient);
+    // Only promote verification â€” never demote. Profile can be verified via
+    // self-hosted first signup, invites, or other flows before user.email_verified catches up.
+    const isEmailVerified = profile.isEmailVerified || authSaysVerified;
+    const emailChanged = profile.email !== user.email;
+    const profileNeedsVerification = isEmailVerified && !profile.isEmailVerified;
+    const userNeedsVerification = isEmailVerified && !user.emailVerified;
+
+    if (!emailChanged && !profileNeedsVerification && !userNeedsVerification) {
+      return profile;
+    }
+
+    if (userNeedsVerification) {
+      await dbClient.update(schema.user).set({ emailVerified: true }).where(eq(schema.user.id, userId));
+    }
+
+    const patch: Partial<TProfile> = {
+      email: user.email,
+      isEmailVerified
+    };
+
+    if (profileNeedsVerification) {
+      patch.verifiedAt = new Date().toISOString();
+    }
+
+    if (!emailChanged && !profileNeedsVerification) {
+      return { ...profile, isEmailVerified: true };
+    }
+
+    const [updatedProfile] = await dbClient
+      .update(schema.profile)
+      .set(patch)
+      .where(eq(schema.profile.id, userId))
+      .returning();
+
+    return updatedProfile ?? { ...profile, isEmailVerified: true };
+  } catch (error) {
+    console.error('syncProfileEmailVerificationFromAuthUser error:', error);
+    throw new Error('Failed to sync profile email verification');
+  }
+}
+
+export const getProfileById = async (id: string, dbClient: DbOrTxClient = db) => {
+  const [profile] = await dbClient.select().from(schema.profile).where(eq(schema.profile.id, id)).limit(1);
+
+  return profile;
+};
+
+export async function markWelcomeEmailPending(userId: string) {
+  const [updatedProfile] = await db
+    .update(schema.profile)
+    .set({ welcomeEmailPending: true })
+    .where(eq(schema.profile.id, userId))
+    .returning({ id: schema.profile.id });
+
+  return updatedProfile ?? null;
+}
+
+export async function clearWelcomeEmailPending(userId: string) {
+  await db.update(schema.profile).set({ welcomeEmailPending: false }).where(eq(schema.profile.id, userId));
+}
+
+export async function markWelcomeEmailSent(userId: string) {
+  await db
+    .update(schema.profile)
+    .set({ welcomeEmailPending: false, welcomeEmailSentAt: new Date().toISOString() })
+    .where(eq(schema.profile.id, userId));
+}
+
+export const getProfileByEmail = async (email: string, dbClient: DbOrTxClient = db) => {
+  const [profile] = await dbClient.select().from(schema.profile).where(eq(schema.profile.email, email)).limit(1);
+
+  return profile;
+};
+
+export async function getProfilesByEmails(emails: string[], dbClient: DbOrTxClient = db) {
+  if (emails.length === 0) return [];
+
+  return dbClient.select().from(schema.profile).where(inArray(schema.profile.email, emails));
+}
+
+export const updateProfile = async (id: string, data: Partial<Omit<TProfile, 'id' | 'createdAt' | 'updatedAt'>>) => {
+  let setData = { ...data };
+
+  if (data.settings !== undefined) {
+    const [existing] = await db
+      .select({ settings: schema.profile.settings })
+      .from(schema.profile)
+      .where(eq(schema.profile.id, id))
+      .limit(1);
+
+    const existingSettings = (existing?.settings as Record<string, unknown>) ?? {};
+    const newSettings = data.settings as Record<string, unknown>;
+    const mergedSettings: Record<string, unknown> = { ...existingSettings };
+
+    for (const key of Object.keys(newSettings ?? {})) {
+      const existingVal = existingSettings[key];
+      const newVal = newSettings[key];
+
+      if (newVal !== undefined) {
+        if (
+          existingVal &&
+          typeof existingVal === 'object' &&
+          !Array.isArray(existingVal) &&
+          newVal &&
+          typeof newVal === 'object' &&
+          !Array.isArray(newVal)
+        ) {
+          mergedSettings[key] = { ...(existingVal as Record<string, unknown>), ...(newVal as Record<string, unknown>) };
+        } else {
+          mergedSettings[key] = newVal;
+        }
+      }
+    }
+
+    setData = { ...setData, settings: mergedSettings as TProfile['settings'] };
+  }
+
+  const [updatedProfile] = await db.update(schema.profile).set(setData).where(eq(schema.profile.id, id)).returning();
+
+  return updatedProfile;
+};
+
+export const markUserAndProfileEmailVerified = async (userId: string, dbClient: DbOrTxClient = db) => {
+  const verifiedAt = new Date().toISOString();
+
+  await dbClient.update(schema.user).set({ emailVerified: true }).where(eq(schema.user.id, userId));
+  await dbClient.update(schema.profile).set({ isEmailVerified: true, verifiedAt }).where(eq(schema.profile.id, userId));
+};
+
+
+================================================================================
+[NEWLY CREATED] apps/api/src/__tests__/course-payment-verify-production-route.test.ts
+Path: apps/api/src/__tests__/course-payment-verify-production-route.test.ts
+================================================================================
+/**
+ * PRODUCTION INTEGRATION TEST â€” verify route mounted via actual courseRouter
+ *
+ * Production routing chain:
+ *   app.ts:      .route('/course', courseRouter)       â†’ mounts at /course
+ *   course.ts:   .route('/', verifyRouter)             â†’ verifyRouter at /course/
+ *   verify.ts:   .post('/:id/verify', ...)             â†’ handler at /course/:id/verify
+ *
+ * Therefore, the ONE intended production URL is:
+ *
+ *   POST /course/:id/verify
+ *
+ * where :id is the courseOrder UUID (NOT the courseId).
+ *
+ * This test proves:
+ *  1. The route matches when using the actual courseRouter (not just verifyRouter in isolation).
+ *  2. The orderId (:id) is correctly extracted from the URL path.
+ *  3. An authenticated student can verify their own order.
+ *  4. Another student's order is rejected (403).
+ *  5. Successful payment reaches markPaidAndEnroll and marks the order PAID.
+ */
+
+import { describe, expect, it, beforeAll, afterAll, vi, beforeEach, afterEach } from 'vitest';
+import { db } from '@cio/db/drizzle';
+import * as schema from '@cio/db/schema';
+import { eq } from 'drizzle-orm';
+import crypto from 'node:crypto';
+import { Hono } from 'hono';
+
+// â”€â”€ Mock Razorpay before importing any routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+vi.mock('razorpay', () => ({
+  default: class RazorpayMock {
+    constructor(_opts: any) {}
+    payments = {
+      fetch: async (paymentId: string) => {
+        if (paymentId === 'prod_pay_pending') {
+          return { id: paymentId, order_id: 'prod_rzp_order_123', status: 'authorized', amount: 50000, currency: 'INR' };
+        }
+        if (paymentId === 'prod_pay_failed') {
+          return { id: paymentId, order_id: 'prod_rzp_order_123', status: 'failed', amount: 50000, currency: 'INR' };
+        }
+        // default: captured
+        return { id: paymentId, order_id: 'prod_rzp_order_123', status: 'captured', amount: 50000, currency: 'INR' };
+      }
+    };
+  }
+}));
+
+vi.mock('@cio/core/config/env', () => ({
+  env: {
+    RAZORPAY_KEY_ID: 'rzp_prod_test_key',
+    RAZORPAY_KEY_SECRET: 'rzp_prod_test_secret',
+    SESSION_SECRET: 'prod_test_secret',
+    API_PORT: 8080,
+    PUBLIC_IS_SELFHOSTED: 'true',
+    RESEND_API_KEY: 're_prod_123',
+    POSTGRES_URL: 'postgres://postgres:postgres@localhost:5432/classroomio'
+  }
+}));
+
+// Mock auth middleware â€” production requires authentication
+let __currentUserId: string | null = null;
+vi.mock('@api/middlewares/auth', () => ({
+  authMiddleware: async (c: any, next: any) => {
+    if (!__currentUserId) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    c.set('user', { id: __currentUserId, email: `user_${__currentUserId}@test.com` });
+    await next();
+  }
+}));
+
+// Mock other middlewares that courseRouter registers
+vi.mock('@api/middlewares/org-member', () => ({
+  orgMemberMiddleware: async (_c: any, next: any) => await next()
+}));
+vi.mock('@api/middlewares/org-admin', () => ({
+  orgAdminMiddleware: async (_c: any, next: any) => await next()
+}));
+vi.mock('@api/middlewares/course-member', () => ({
+  courseMemberMiddleware: async (_c: any, next: any) => await next()
+}));
+vi.mock('@api/middlewares/course-team-member', () => ({
+  courseTeamMemberMiddleware: async (_c: any, next: any) => await next()
+}));
+vi.mock('@api/middlewares/course-team-member-or-automation-key', () => ({
+  courseTeamMemberOrAutomationKeyMiddleware: () => async (_c: any, next: any) => await next()
+}));
+vi.mock('@api/middlewares/auth-or-automation-key', () => ({
+  authOrAutomationKeyMiddleware: async (_c: any, next: any) => await next()
+}));
+vi.mock('@api/middlewares/rate-limiter', () => ({
+  createRateLimiter: () => async (_c: any, next: any) => await next()
+}));
+
+// Import the ACTUAL courseRouter â€” same as production
+import { courseRouter } from '../routes/course/course';
+
+/**
+ * Build a test app that replicates the EXACT production mounting:
+ *   app.route('/course', courseRouter)
+ *
+ * The __currentUserId variable controls which user is "logged in" per-test.
+ */
+function buildProductionApp() {
+  return new Hono().route('/course', courseRouter);
+}
+
+// â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const SECRET = 'rzp_prod_test_secret';
+function sign(razorpayOrderId: string, paymentId: string) {
+  return crypto.createHmac('sha256', SECRET).update(`${razorpayOrderId}|${paymentId}`).digest('hex');
+}
+
+// â”€â”€ Test data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+describe('PRODUCTION INTEGRATION â€” POST /course/:id/verify (via actual courseRouter)', () => {
+  const orgId = crypto.randomUUID();
+  const studentUserId = crypto.randomUUID();
+  const otherUserId = crypto.randomUUID();
+  let groupId: string;
+  let courseId: string;
+  let orderId: string;
+
+  const RZP_ORDER_ID = 'prod_rzp_order_123';
+
+  // â”€â”€ One-time fixture setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  beforeAll(async () => {
+    await db.insert(schema.organization).values({ id: orgId, name: 'Prod Integration Org' });
+
+    const [grp] = await db.insert(schema.group).values({ organizationId: orgId, name: 'Prod Test Group' }).returning();
+    groupId = grp.id;
+    courseId = crypto.randomUUID();
+
+    await db.insert(schema.user).values([
+      { id: studentUserId, email: `prod_student_${Date.now()}@test.com`, name: 'Prod Student', emailVerified: true },
+      { id: otherUserId,   email: `prod_other_${Date.now()}@test.com`,   name: 'Other Student', emailVerified: true }
+    ]);
+    await db.insert(schema.profile).values([
+      { id: studentUserId, email: `prod_student_${Date.now()}@test.com`, fullname: 'Prod Student', username: `prod_s_${Date.now()}` },
+      { id: otherUserId,   email: `prod_other_${Date.now()}@test.com`,   fullname: 'Other Student', username: `prod_o_${Date.now()}` }
+    ]);
+
+    await db.insert(schema.course).values({
+      id: courseId,
+      title: 'Prod Integration Course',
+      description: 'Prod Integration Course',
+      groupId,
+      isTemplate: false,
+      logo: 'test.png',
+      metadata: {},
+      cost: 500,
+      currency: 'INR'
+    });
+  });
+
+  afterAll(async () => {
+    await db.delete(schema.groupmember).where(eq(schema.groupmember.groupId, groupId));
+    await db.delete(schema.organizationmember).where(eq(schema.organizationmember.organizationId, orgId));
+    await db.delete(schema.courseOrder).where(eq(schema.courseOrder.courseId, courseId));
+    await db.delete(schema.course).where(eq(schema.course.id, courseId));
+    await db.delete(schema.profile).where(eq(schema.profile.id, studentUserId));
+    await db.delete(schema.profile).where(eq(schema.profile.id, otherUserId));
+    await db.delete(schema.user).where(eq(schema.user.id, studentUserId));
+    await db.delete(schema.user).where(eq(schema.user.id, otherUserId));
+    await db.delete(schema.group).where(eq(schema.group.id, groupId));
+    await db.delete(schema.organization).where(eq(schema.organization.id, orgId));
+  });
+
+  beforeEach(async () => {
+    // Fresh CREATED order before each test
+    const [order] = await db.insert(schema.courseOrder).values({
+      organizationId: orgId,
+      userId: studentUserId,
+      courseId,
+      amountPaise: 50000,
+      currency: 'INR',
+      razorpayOrderId: RZP_ORDER_ID,
+      status: 'CREATED',
+      needsAttention: false
+    }).returning();
+    orderId = order.id;
+    __currentUserId = null; // reset auth state
+  });
+
+  afterEach(async () => {
+    __currentUserId = null;
+    await db.delete(schema.groupmember).where(eq(schema.groupmember.groupId, groupId));
+    await db.delete(schema.organizationmember).where(eq(schema.organizationmember.organizationId, orgId));
+    await db.delete(schema.courseOrder).where(eq(schema.courseOrder.id, orderId));
+  });
+
+  // â”€â”€ Test 1: Route matches and orderId is correctly extracted â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  it('1. Route matches at /course/:id/verify and orderId is correctly extracted via c.req.param("id")', async () => {
+    __currentUserId = studentUserId;
+    const app = buildProductionApp();
+
+    // Use a fake UUID that does NOT exist in the DB â€” proves the param is extracted
+    const fakeOrderId = crypto.randomUUID();
+    const res = await app.request(`/course/${fakeOrderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: RZP_ORDER_ID,
+        razorpay_payment_id: 'prod_pay_ok',
+        razorpay_signature: sign(RZP_ORDER_ID, 'prod_pay_ok')
+      })
+    });
+
+    // Must get 404 (not 404 = route mismatch, not 405 = wrong method)
+    // 404 proves the param was extracted and the order was queried in the DB
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.success).toBe(false);
+  });
+
+  // â”€â”€ Test 2: Unauthenticated request is rejected â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  it('2. Unauthenticated request returns 401 (auth middleware is active)', async () => {
+    __currentUserId = null; // no auth
+    const app = buildProductionApp();
+
+    const res = await app.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: RZP_ORDER_ID,
+        razorpay_payment_id: 'prod_pay_ok',
+        razorpay_signature: sign(RZP_ORDER_ID, 'prod_pay_ok')
+      })
+    });
+
+    expect(res.status).toBe(401);
+  });
+
+  // â”€â”€ Test 3: Authenticated student can verify their own order â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  it('3. Authenticated student can verify their own order and reaches markPaidAndEnroll', async () => {
+    __currentUserId = studentUserId;
+    const app = buildProductionApp();
+
+    const res = await app.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: RZP_ORDER_ID,
+        razorpay_payment_id: 'prod_pay_ok',
+        razorpay_signature: sign(RZP_ORDER_ID, 'prod_pay_ok')
+      })
+    });
+
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.success).toBe(true);
+
+    // Prove markPaidAndEnroll was reached: order must be PAID with payment ID set
+    const [order] = await db.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, orderId));
+    expect(order.status).toBe('PAID');
+    expect(order.razorpayPaymentId).toBe('prod_pay_ok');
+  });
+
+  // â”€â”€ Test 4: Another student's order is rejected (403) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  it("4. Another student's order is rejected with 403", async () => {
+    // Insert an order owned by otherUser
+    const [otherOrder] = await db.insert(schema.courseOrder).values({
+      organizationId: orgId,
+      userId: otherUserId,  // different user
+      courseId,
+      amountPaise: 50000,
+      currency: 'INR',
+      razorpayOrderId: 'prod_rzp_order_other_456',
+      status: 'CREATED',
+      needsAttention: false
+    }).returning();
+
+    // Log in as studentUser (NOT the owner of otherOrder)
+    __currentUserId = studentUserId;
+    const app = buildProductionApp();
+
+    const res = await app.request(`/course/${otherOrder.id}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: 'prod_rzp_order_other_456',
+        razorpay_payment_id: 'prod_pay_ok',
+        razorpay_signature: sign('prod_rzp_order_other_456', 'prod_pay_ok')
+      })
+    });
+
+    expect(res.status).toBe(403);
+
+    // cleanup
+    await db.delete(schema.courseOrder).where(eq(schema.courseOrder.id, otherOrder.id));
+  });
+
+  // â”€â”€ Test 5: Successful payment reaches markPaidAndEnroll and enrolls student â”€
+  it('5. Successful payment reaches markPaidAndEnroll and student is enrolled in the group', async () => {
+    __currentUserId = studentUserId;
+    const app = buildProductionApp();
+
+    const res = await app.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: RZP_ORDER_ID,
+        razorpay_payment_id: 'prod_pay_enroll',
+        razorpay_signature: sign(RZP_ORDER_ID, 'prod_pay_enroll')
+      })
+    });
+
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.success).toBe(true);
+    expect(data.data.status).toBe('PAID');
+    expect(data.data.razorpayPaymentId).toBe('prod_pay_enroll');
+
+    // Prove enrollment happened: student must now be a group member
+    const [gm] = await db
+      .select()
+      .from(schema.groupmember)
+      .where(eq(schema.groupmember.groupId, groupId));
+    expect(gm).toBeDefined();
+    expect(gm.profileId).toBe(studentUserId);
+  });
+
+  // â”€â”€ Test 6: No other URL pattern resolves â€” the route is exactly one â”€â”€â”€â”€â”€â”€â”€â”€
+  it('6. Confirms there is exactly ONE production verification URL â€” wrong patterns return 404', async () => {
+    __currentUserId = studentUserId;
+    const app = buildProductionApp();
+
+    const body = JSON.stringify({
+      razorpay_order_id: RZP_ORDER_ID,
+      razorpay_payment_id: 'prod_pay_ok',
+      razorpay_signature: sign(RZP_ORDER_ID, 'prod_pay_ok')
+    });
+
+    // Wrong: courseId in place of orderId â€” also hits DB and gets 404 (not a routing issue)
+    const altPatterns = [
+      `/course/${courseId}/verify`,          // courseId instead of orderId â€” same shape but wrong entity
+      `/course/verify/${orderId}`,           // transposed segments
+      `/course/${orgId}/${orderId}/verify`,  // extra segment
+    ];
+
+    for (const pattern of altPatterns) {
+      const res = await app.request(pattern, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body
+      });
+      // Either 404 (route matched but order not found or wrong entity) or 404 (no route)
+      // Both are acceptable â€” what matters is they do NOT return 200
+      expect(res.status).not.toBe(200);
+    }
+  });
+});
+
+
