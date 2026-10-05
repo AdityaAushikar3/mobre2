@@ -89,8 +89,8 @@ export async function syncProfileEmailVerificationFromAuthUser(userId: string, d
   }
 }
 
-export const getProfileById = async (id: string) => {
-  const [profile] = await db.select().from(schema.profile).where(eq(schema.profile.id, id)).limit(1);
+export const getProfileById = async (id: string, dbClient: DbOrTxClient = db) => {
+  const [profile] = await dbClient.select().from(schema.profile).where(eq(schema.profile.id, id)).limit(1);
 
   return profile;
 };

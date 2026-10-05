@@ -1,7 +1,7 @@
 import { AppError, ErrorCodes } from '@cio/utils/errors';
 import { db, type DbOrTxClient } from '@cio/db/drizzle';
 import * as schema from '@cio/db/schema';
-import { and, eq, sql, isNull } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 import { getCourseById } from '@cio/db/queries/course';
 import { env } from '../../config/env';
 import Razorpay from 'razorpay';
@@ -106,9 +106,8 @@ export async function createCoursePurchase(courseId: string, userId: string, org
       }
     }
 
-    // Look for an existing CREATED order within 30 minutes that is fully reusable
-    const thirtyMinsAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-
+    // Reuse any active unpaid CREATED order for this user/course at the same price.
+    // The transaction-scoped advisory lock prevents concurrent requests from creating duplicates.
     const [existingOrder] = await tx
       .select()
       .from(schema.courseOrder)
@@ -118,8 +117,7 @@ export async function createCoursePurchase(courseId: string, userId: string, org
           eq(schema.courseOrder.courseId, courseId),
           eq(schema.courseOrder.status, 'CREATED'),
           isNull(schema.courseOrder.razorpayPaymentId),
-          eq(schema.courseOrder.needsAttention, false),
-          sql`${schema.courseOrder.createdAt} >= ${thirtyMinsAgo}`
+          eq(schema.courseOrder.needsAttention, false)
         )
       )
       .orderBy(sql`${schema.courseOrder.createdAt} DESC`)
@@ -134,7 +132,8 @@ export async function createCoursePurchase(courseId: string, userId: string, org
       };
     }
 
-    // We need to create a new order
+    // Create the provider order first. If it fails, the local transaction makes no
+    // changes to existing unpaid orders, avoiding a false superseded state.
     const razorpay = getRazorpayClient();
     const receiptId = crypto.randomUUID().slice(0, 36);
 
@@ -151,6 +150,26 @@ export async function createCoursePurchase(courseId: string, userId: string, org
     if (!rzpOrder || !rzpOrder.id) {
       throw new AppError('Failed to create payment order with provider', ErrorCodes.INTERNAL_ERROR, 500);
     }
+
+    // A new order supersedes any older unpaid, non-attention CREATED orders.
+    // Keeping the old Razorpay order locally attention-locked ensures a late payment
+    // cannot auto-enroll the student or become the active paid order.
+    await tx
+      .update(schema.courseOrder)
+      .set({
+        needsAttention: true,
+        attentionReason: 'AMOUNT_MISMATCH',
+        updatedAt: new Date().toISOString()
+      })
+      .where(
+        and(
+          eq(schema.courseOrder.userId, userId),
+          eq(schema.courseOrder.courseId, courseId),
+          eq(schema.courseOrder.status, 'CREATED'),
+          isNull(schema.courseOrder.razorpayPaymentId),
+          eq(schema.courseOrder.needsAttention, false)
+        )
+      );
 
     const [newOrder] = await tx
       .insert(schema.courseOrder)

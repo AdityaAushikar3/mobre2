@@ -3,6 +3,7 @@ import { db } from '@cio/db/drizzle';
 import * as schema from '@cio/db/schema';
 import { eq } from 'drizzle-orm';
 import { createCoursePurchase } from '@cio/core/services/course/purchase';
+import { markPaidAndEnroll } from '@cio/core/services/course/payment';
 import { ROLE } from '@cio/utils/constants';
 
 // Mock Razorpay to simulate external network delay and deterministic behavior
@@ -41,8 +42,7 @@ describe('Course Purchase Concurrency & State', () => {
   beforeAll(async () => {
     await db.insert(schema.organization).values({
       id: orgId,
-      name: 'Test Org',
-      slug: `test-org-${Date.now()}`
+      name: 'Test Org'
     });
 
     const [group] = await db
@@ -173,38 +173,114 @@ describe('Course Purchase Concurrency & State', () => {
       expect(res.razorpayOrderId).toBe(existingOrderId);
     });
 
-    it('razorpayPaymentId != NULL is NOT reused (gets fresh order)', async () => {
+    it('razorpayPaymentId != NULL is NOT reused (gets a fresh order)', async () => {
+      const blockedOrderId = `order_with_payment_${crypto.randomUUID()}`;
+
       await db.insert(schema.courseOrder).values({
         organizationId: orgId,
         userId: userId,
-        courseId: courseId,
+        courseId,
         amountPaise: 50000,
         currency: 'INR',
-        razorpayOrderId: `order_failed_${Date.now()}`,
+        razorpayOrderId: blockedOrderId,
         razorpayPaymentId: 'pay_xyz123',
         status: 'CREATED',
         needsAttention: false
       });
 
       const res = await createCoursePurchase(courseId, userId, orgId);
-      expect(res.razorpayOrderId).not.toBe(`order_failed_${Date.now()}`);
+
+      expect(res.razorpayOrderId).not.toBe(blockedOrderId);
       expect(res.razorpayOrderId.startsWith('order_')).toBe(true);
     });
 
     it('needsAttention=true is NOT reused', async () => {
+      const attentionOrderId = `order_attn_${crypto.randomUUID()}`;
+
       await db.insert(schema.courseOrder).values({
         organizationId: orgId,
         userId: userId,
         courseId: courseId,
         amountPaise: 50000,
         currency: 'INR',
-        razorpayOrderId: `order_attn_${Date.now()}`,
+        razorpayOrderId: attentionOrderId,
         status: 'CREATED',
         needsAttention: true
       });
 
       const res = await createCoursePurchase(courseId, userId, orgId);
-      expect(res.razorpayOrderId).not.toBe(`order_attn_${Date.now()}`);
+      expect(res.razorpayOrderId).not.toBe(attentionOrderId);
+    });
+
+    it('reuses an older active CREATED order regardless of age', async () => {
+      const oldOrderId = `order_old_${crypto.randomUUID()}`;
+      const oldDate = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: oldOrderId,
+        status: 'CREATED',
+        needsAttention: false,
+        createdAt: oldDate,
+        updatedAt: oldDate
+      });
+
+      const res = await createCoursePurchase(courseId, userId, orgId);
+
+      expect(res.razorpayOrderId).toBe(oldOrderId);
+    });
+
+    it('price change creates a new order and supersedes older unpaid order', async () => {
+      const first = await createCoursePurchase(courseId, userId, orgId);
+
+      await db.update(schema.course).set({ cost: 600 }).where(eq(schema.course.id, courseId));
+
+      const second = await createCoursePurchase(courseId, userId, orgId);
+
+      expect(second.orderId).not.toBe(first.orderId);
+
+      const [oldOrder] = await db.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, first.orderId));
+
+      expect(oldOrder.status).toBe('CREATED');
+      expect(oldOrder.razorpayPaymentId).toBeNull();
+      expect(oldOrder.needsAttention).toBe(true);
+      expect(oldOrder.attentionReason).toBe('AMOUNT_MISMATCH');
+
+      const [newOrder] = await db.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, second.orderId));
+
+      expect(newOrder.status).toBe('CREATED');
+      expect(newOrder.needsAttention).toBe(false);
+      expect(newOrder.amountPaise).toBe(60000);
+    });
+
+    it('a late payment for a superseded order is traceable but cannot enroll', async () => {
+      const first = await createCoursePurchase(courseId, userId, orgId);
+
+      await db.update(schema.course).set({ cost: 600 }).where(eq(schema.course.id, courseId));
+      await createCoursePurchase(courseId, userId, orgId);
+
+      const enrollFn = vi.fn();
+      const result = await markPaidAndEnroll(
+        {
+          id: `pay_superseded_${crypto.randomUUID()}`,
+          razorpayOrderId: first.razorpayOrderId,
+          status: 'captured',
+          amountPaise: 50000,
+          currency: 'INR'
+        },
+        enrollFn
+      );
+
+      expect(result.handled).toBe(true);
+      expect(result.order.status).toBe('CREATED');
+      expect(result.order.needsAttention).toBe(true);
+      expect(result.order.attentionReason).toBe('AMOUNT_MISMATCH');
+      expect(result.order.razorpayPaymentId).toBeDefined();
+      expect(enrollFn).not.toHaveBeenCalled();
     });
 
     it('already enrolled via groupmember rejects purchase', async () => {
@@ -224,8 +300,7 @@ describe('Course Purchase Concurrency & State', () => {
       const otherOrgId = crypto.randomUUID();
       await db.insert(schema.organization).values({
         id: otherOrgId,
-        name: 'Other Org',
-        slug: `other-org-${Date.now()}`
+        name: 'Other Org'
       });
 
       await expect(createCoursePurchase(courseId, userId, otherOrgId)).rejects.toThrow(

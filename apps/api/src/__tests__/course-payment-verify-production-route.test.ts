@@ -95,33 +95,27 @@ describe('PRODUCTION INTEGRATION — POST /course/orders/:orderId/verify (via ac
     courseId = crypto.randomUUID();
     groupId = crypto.randomUUID();
 
-    await db.insert(schema.organization).values({ id: orgId, name: 'Prod Org', slug: `prod-${orgId}` });
+    await db.insert(schema.organization).values({ id: orgId, name: 'Prod Org' });
     await db
       .insert(schema.user)
       .values({ id: studentUserId, name: 'Student', email: `student_${studentUserId}@example.com` });
     await db
       .insert(schema.user)
       .values({ id: otherUserId, name: 'Other User', email: `other_${otherUserId}@example.com` });
-    await db
-      .insert(schema.profile)
-      .values({
-        id: studentUserId,
-        fullname: 'Student',
-        username: `student_${studentUserId}`,
-        email: `student_${studentUserId}@example.com`
-      });
-    await db
-      .insert(schema.profile)
-      .values({
-        id: otherUserId,
-        fullname: 'Other User',
-        username: `other_${otherUserId}`,
-        email: `other_${otherUserId}@example.com`
-      });
+    await db.insert(schema.profile).values({
+      id: studentUserId,
+      fullname: 'Student',
+      username: `student_${studentUserId}`,
+      email: `student_${studentUserId}@example.com`
+    });
+    await db.insert(schema.profile).values({
+      id: otherUserId,
+      fullname: 'Other User',
+      username: `other_${otherUserId}`,
+      email: `other_${otherUserId}@example.com`
+    });
     await db.insert(schema.group).values({ id: groupId, organizationId: orgId, name: 'Prod Group' });
-    await db
-      .insert(schema.course)
-      .values({ id: courseId, organizationId: orgId, groupId, title: 'Prod Course', description: 'Description' });
+    await db.insert(schema.course).values({ id: courseId, groupId, title: 'Prod Course', description: 'Description' });
 
     const [order] = await db
       .insert(schema.courseOrder)
@@ -156,7 +150,7 @@ describe('PRODUCTION INTEGRATION — POST /course/orders/:orderId/verify (via ac
     await db.delete(schema.organization).where(eq(schema.organization.id, orgId));
   });
 
-  it('1. Route matches at /course/orders/:orderId/verify and orderId is correctly extracted via c.req.param("orderId")', async () => {
+  it('1. Intended production verification path resolves to the verification handler', async () => {
     __currentUserId = studentUserId;
     const app = buildProductionApp();
 
@@ -174,6 +168,24 @@ describe('PRODUCTION INTEGRATION — POST /course/orders/:orderId/verify (via ac
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.success).toBe(false);
+    expect(body.code).toBeDefined();
+  });
+
+  it('does not expose the legacy /course/:orderId/verify path', async () => {
+    __currentUserId = studentUserId;
+    const app = buildProductionApp();
+
+    const res = await app.request(`/course/${orderId}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        razorpay_order_id: RZP_ORDER_ID,
+        razorpay_payment_id: RZP_PAY_OK,
+        razorpay_signature: sign(RZP_ORDER_ID, RZP_PAY_OK)
+      })
+    });
+
+    expect(res.status).toBe(404);
   });
 
   it('2. Unauthenticated request returns 401 (auth middleware is active)', async () => {

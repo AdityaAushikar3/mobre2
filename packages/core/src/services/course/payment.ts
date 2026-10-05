@@ -1,6 +1,6 @@
 import { db, type DbOrTxClient } from '@cio/db/drizzle';
 import * as schema from '@cio/db/schema';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 import { AppError, ErrorCodes } from '@cio/utils/errors';
 
 export type VerifiedPayment = {
@@ -74,7 +74,7 @@ export async function markPaidAndEnroll(
         if (order.razorpayPaymentId === payment.id) {
           return { handled: true, alreadyEnrolled: false, order };
         } else {
-          const existingPaymentIds = order.attentionPaymentIds ?? [];
+          const existingPaymentIds = (order.attentionPaymentIds as string[]) ?? [];
           const updatedPaymentIds = existingPaymentIds.includes(payment.id)
             ? existingPaymentIds
             : [...existingPaymentIds, payment.id];
@@ -103,7 +103,7 @@ export async function markPaidAndEnroll(
         if (order.razorpayPaymentId === payment.id) {
           return { handled: true, alreadyEnrolled: false, order };
         } else {
-          const existingPaymentIds = order.attentionPaymentIds ?? [];
+          const existingPaymentIds = (order.attentionPaymentIds as string[]) ?? [];
           const updatedPaymentIds = existingPaymentIds.includes(payment.id)
             ? existingPaymentIds
             : [...existingPaymentIds, payment.id];
@@ -118,6 +118,10 @@ export async function markPaidAndEnroll(
             })
             .where(eq(schema.courseOrder.id, order.id));
 
+          console.error(
+            `[DUPLICATE_PAYMENT] Order ${order.id} already recorded payment ${order.razorpayPaymentId}; ignoring incoming payment ${payment.id}`
+          );
+
           const [updatedOrder] = await tx.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, order.id));
           return { handled: true, alreadyEnrolled: false, order: updatedOrder };
         }
@@ -130,7 +134,7 @@ export async function markPaidAndEnroll(
         !order.razorpayPaymentId &&
         order.attentionReason !== 'ENROLLMENT_FAILED'
       ) {
-        const existingPaymentIds = order.attentionPaymentIds ?? [];
+        const existingPaymentIds = (order.attentionPaymentIds as string[]) ?? [];
         const updatedPaymentIds = existingPaymentIds.includes(payment.id)
           ? existingPaymentIds
           : [...existingPaymentIds, payment.id];
@@ -138,6 +142,8 @@ export async function markPaidAndEnroll(
         await tx
           .update(schema.courseOrder)
           .set({
+            needsAttention: true,
+            attentionReason: order.attentionReason,
             razorpayPaymentId: payment.id,
             attentionPaymentIds: updatedPaymentIds,
             updatedAt: new Date().toISOString()
@@ -161,7 +167,7 @@ export async function markPaidAndEnroll(
       }
 
       if (payment.amountPaise !== order.amountPaise || payment.currency !== order.currency) {
-        const existingPaymentIds = order.attentionPaymentIds ?? [];
+        const existingPaymentIds = (order.attentionPaymentIds as string[]) ?? [];
         const updatedPaymentIds = existingPaymentIds.includes(payment.id)
           ? existingPaymentIds
           : [...existingPaymentIds, payment.id];
@@ -218,10 +224,23 @@ export async function markPaidAndEnroll(
       console.error(`[ENROLLMENT_FAILED] Order ${preOrder.id}:`, error.cause);
 
       try {
-        await db
+        const result = await db
           .update(schema.courseOrder)
           .set({ needsAttention: true, attentionReason: 'ENROLLMENT_FAILED', updatedAt: new Date().toISOString() })
-          .where(eq(schema.courseOrder.id, preOrder.id));
+          .where(
+            and(
+              eq(schema.courseOrder.id, preOrder.id),
+              eq(schema.courseOrder.status, 'CREATED'),
+              isNull(schema.courseOrder.razorpayPaymentId)
+            )
+          )
+          .returning({ id: schema.courseOrder.id });
+
+        if (result.length === 0) {
+          console.error(
+            `[ENROLLMENT_FAILED] Order ${preOrder.id} changed state before failure marker could be persisted; refusing to overwrite current state.`
+          );
+        }
       } catch (updateError) {
         console.error(`Failed to update ENROLLMENT_FAILED for order ${preOrder.id}:`, updateError);
       }
