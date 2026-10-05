@@ -1,7 +1,7 @@
 import { AppError, ErrorCodes } from '@cio/utils/errors';
 import { db, type DbOrTxClient } from '@cio/db/drizzle';
 import * as schema from '@cio/db/schema';
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, eq, isNull, isNotNull, sql } from 'drizzle-orm';
 import { getCourseById } from '@cio/db/queries/course';
 import { env } from '../../config/env';
 import Razorpay from 'razorpay';
@@ -69,6 +69,29 @@ export async function createCoursePurchase(courseId: string, userId: string, org
     // Ensure it's an exact integer, do not silently round
     if (amountPaise % 1 !== 0) {
       throw new AppError('Course price is not a valid discrete amount in paise', ErrorCodes.VALIDATION_ERROR, 400);
+    }
+
+    // Unresolved payment-bearing order check
+    const [pendingPaymentOrder] = await tx
+      .select()
+      .from(schema.courseOrder)
+      .where(
+        and(
+          eq(schema.courseOrder.userId, userId),
+          eq(schema.courseOrder.courseId, courseId),
+          eq(schema.courseOrder.status, 'CREATED'),
+          isNotNull(schema.courseOrder.razorpayPaymentId),
+          eq(schema.courseOrder.needsAttention, true)
+        )
+      )
+      .limit(1);
+
+    if (pendingPaymentOrder) {
+      throw new AppError(
+        'Your previous payment requires attention. Please contact support before starting another purchase.',
+        ErrorCodes.CONFLICT,
+        400
+      );
     }
 
     // Unresolved ENROLLMENT_FAILED check

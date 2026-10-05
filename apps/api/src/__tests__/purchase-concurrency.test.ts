@@ -150,6 +150,26 @@ describe('Course Purchase Concurrency & State', () => {
       );
     });
 
+    it('blocks new purchase when an existing CREATED order has a payment ID and needsAttention=true', async () => {
+      const dynamicPaymentId = `pay_attn_${crypto.randomUUID()}`;
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: `order_attn_${crypto.randomUUID()}`,
+        razorpayPaymentId: dynamicPaymentId,
+        status: 'CREATED',
+        needsAttention: true,
+        attentionReason: 'DUPLICATE_PAYMENT'
+      });
+
+      await expect(createCoursePurchase(courseId, userId, orgId)).rejects.toThrow(
+        'Your previous payment requires attention. Please contact support before starting another purchase.'
+      );
+    });
+
     it('PAID ENROLLMENT_FAILED does NOT block as unresolved purchase', async () => {
       await db.insert(schema.courseOrder).values({
         organizationId: orgId,

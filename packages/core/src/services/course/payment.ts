@@ -221,12 +221,23 @@ export async function markPaidAndEnroll(
     });
   } catch (error) {
     if (error instanceof EnrollmentFailedError && transactionRolledBack) {
-      console.error(`[ENROLLMENT_FAILED] Order ${preOrder.id}:`, error.cause);
+      console.error(
+        `[ENROLLMENT_FAILED] Local Order: ${preOrder.id}, User: ${preOrder.userId}, Course: ${preOrder.courseId}, Razorpay Order: ${preOrder.razorpayOrderId}, Payment ID: ${payment.id}. Reason:`,
+        error.cause
+      );
 
       try {
+        const existingIds = (preOrder.attentionPaymentIds as string[]) ?? [];
+        const updatedIds = existingIds.includes(payment.id) ? existingIds : [...existingIds, payment.id];
+
         const result = await db
           .update(schema.courseOrder)
-          .set({ needsAttention: true, attentionReason: 'ENROLLMENT_FAILED', updatedAt: new Date().toISOString() })
+          .set({
+            needsAttention: true,
+            attentionReason: 'ENROLLMENT_FAILED',
+            attentionPaymentIds: updatedIds,
+            updatedAt: new Date().toISOString()
+          })
           .where(
             and(
               eq(schema.courseOrder.id, preOrder.id),
@@ -246,7 +257,7 @@ export async function markPaidAndEnroll(
       }
 
       throw new AppError(
-        'Payment verified but enrollment failed. Support has been notified.',
+        'Payment verified but enrollment failed. Please contact support.',
         ErrorCodes.INTERNAL_ERROR,
         500
       );

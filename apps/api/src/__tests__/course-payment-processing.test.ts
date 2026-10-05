@@ -431,5 +431,194 @@ describe('Course Payment Processing State Machine', () => {
       expect(orders.filter((order) => order.status === 'PAID')).toHaveLength(2);
       expect(new Set(orders.map((order) => order.razorpayPaymentId)).size).toBe(2);
     });
+
+    it('SAME order + SAME payment concurrently is idempotent', async () => {
+      const orderId = `order_same_${crypto.randomUUID()}`;
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: orderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const paymentId = `pay_${crypto.randomUUID()}`;
+      const payment = {
+        id: paymentId,
+        razorpayOrderId: orderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enroll1 = vi.fn().mockImplementation(async (tx, order, course) => {
+        return enrollStudentInCourseTransaction(tx, order, course);
+      });
+      const enroll2 = vi.fn().mockImplementation(async (tx, order, course) => {
+        return enrollStudentInCourseTransaction(tx, order, course);
+      });
+
+      const [result1, result2] = await Promise.all([
+        markPaidAndEnroll(payment, enroll1),
+        markPaidAndEnroll(payment, enroll2)
+      ]);
+
+      const [updatedOrder] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, orderId));
+      expect(updatedOrder.status).toBe('PAID');
+      expect(updatedOrder.razorpayPaymentId).toBe(paymentId);
+
+      const memberships = await db
+        .select()
+        .from(schema.groupmember)
+        .where(and(eq(schema.groupmember.groupId, groupId), eq(schema.groupmember.profileId, userId)));
+      expect(memberships).toHaveLength(1);
+
+      const orgMemberships = await db
+        .select()
+        .from(schema.organizationmember)
+        .where(
+          and(eq(schema.organizationmember.organizationId, orgId), eq(schema.organizationmember.profileId, userId))
+        );
+      expect(orgMemberships).toHaveLength(1);
+    });
+
+    it('SAME order + DIFFERENT payments concurrently', async () => {
+      const orderId = `order_diff_${crypto.randomUUID()}`;
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: orderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const paymentAId = `pay_${crypto.randomUUID()}`;
+      const paymentA = {
+        id: paymentAId,
+        razorpayOrderId: orderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+      const paymentBId = `pay_${crypto.randomUUID()}`;
+      const paymentB = {
+        id: paymentBId,
+        razorpayOrderId: orderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const enrollA = vi
+        .fn()
+        .mockImplementation(async (tx, order, course) => enrollStudentInCourseTransaction(tx, order, course));
+      const enrollB = vi
+        .fn()
+        .mockImplementation(async (tx, order, course) => enrollStudentInCourseTransaction(tx, order, course));
+
+      await Promise.all([markPaidAndEnroll(paymentA, enrollA), markPaidAndEnroll(paymentB, enrollB)]);
+
+      const [updatedOrder] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, orderId));
+      expect(updatedOrder.status).toBe('PAID');
+      expect(updatedOrder.razorpayPaymentId === paymentAId || updatedOrder.razorpayPaymentId === paymentBId).toBe(true);
+
+      expect(updatedOrder.needsAttention).toBe(true);
+      expect(updatedOrder.attentionReason).toBe('DUPLICATE_PAYMENT');
+
+      const attentionIds = updatedOrder.attentionPaymentIds as string[];
+      expect(attentionIds).toBeDefined();
+      expect(attentionIds.length).toBe(1);
+      const duplicateId = updatedOrder.razorpayPaymentId === paymentAId ? paymentBId : paymentAId;
+      expect(attentionIds).toContain(duplicateId);
+
+      const memberships = await db
+        .select()
+        .from(schema.groupmember)
+        .where(and(eq(schema.groupmember.groupId, groupId), eq(schema.groupmember.profileId, userId)));
+      expect(memberships).toHaveLength(1);
+    });
+
+    it('real transaction rollback test', async () => {
+      const orderId = `order_rollback_${crypto.randomUUID()}`;
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: orderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const paymentId = `pay_rollback_${crypto.randomUUID()}`;
+      const payment = {
+        id: paymentId,
+        razorpayOrderId: orderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      const failingEnrollmentFunction = async (tx: any, order: any, course: any) => {
+        // Create an organization member using the supplied tx
+        await tx.insert(schema.organizationmember).values({
+          organizationId: orgId,
+          profileId: userId,
+          role: 'member'
+        });
+
+        // Create a group member using the supplied tx
+        await tx.insert(schema.groupmember).values({
+          groupId: groupId,
+          profileId: userId,
+          role: 'member'
+        });
+
+        throw new Error('intentional rollback');
+      };
+
+      await expect(markPaidAndEnroll(payment, failingEnrollmentFunction)).rejects.toThrow(
+        'Payment verified but enrollment failed. Please contact support.'
+      );
+
+      const [updatedOrder] = await db
+        .select()
+        .from(schema.courseOrder)
+        .where(eq(schema.courseOrder.razorpayOrderId, orderId));
+      expect(updatedOrder.status).toBe('CREATED');
+      expect(updatedOrder.razorpayPaymentId).toBeNull();
+      expect(updatedOrder.needsAttention).toBe(true);
+      expect(updatedOrder.attentionReason).toBe('ENROLLMENT_FAILED');
+
+      const attentionIds = updatedOrder.attentionPaymentIds as string[];
+      expect(attentionIds).toContain(paymentId);
+
+      const memberships = await db
+        .select()
+        .from(schema.groupmember)
+        .where(and(eq(schema.groupmember.groupId, groupId), eq(schema.groupmember.profileId, userId)));
+      expect(memberships).toHaveLength(0);
+
+      const orgMemberships = await db
+        .select()
+        .from(schema.organizationmember)
+        .where(
+          and(eq(schema.organizationmember.organizationId, orgId), eq(schema.organizationmember.profileId, userId))
+        );
+      expect(orgMemberships).toHaveLength(0);
+    });
   });
 });

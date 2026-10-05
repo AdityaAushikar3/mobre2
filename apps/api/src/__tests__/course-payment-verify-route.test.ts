@@ -26,6 +26,22 @@ vi.mock('razorpay', () => ({
           throw error;
         }
 
+        if (paymentId === 'pay_auth_error') {
+          const error: any = new Error('Unauthorized');
+          error.statusCode = 401;
+          throw error;
+        }
+
+        if (paymentId === 'pay_bad_request_not_found') {
+          const error: any = new Error('Bad request');
+          error.error = { code: 'BAD_REQUEST_ERROR', description: 'payment does not exist' };
+          throw error;
+        }
+
+        if (paymentId === 'pay_econnreset') {
+          throw new Error('ECONNRESET');
+        }
+
         if (paymentId === 'pay_pending') {
           return {
             id: paymentId,
@@ -345,6 +361,39 @@ describe('Course payment verification route', () => {
 
   it('returns 502 for provider/network/server failures', async () => {
     const paymentId = 'pay_provider_error';
+    const res = await request({
+      razorpay_order_id: razorpayOrderId,
+      razorpay_payment_id: paymentId,
+      razorpay_signature: signatureFor(razorpayOrderId, paymentId)
+    });
+
+    expect(res.status).toBe(502);
+  });
+
+  it('returns 404 for BAD_REQUEST_ERROR that describes payment does not exist', async () => {
+    const paymentId = 'pay_bad_request_not_found';
+    const res = await request({
+      razorpay_order_id: razorpayOrderId,
+      razorpay_payment_id: paymentId,
+      razorpay_signature: signatureFor(razorpayOrderId, paymentId)
+    });
+
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 502 for 401 authentication error', async () => {
+    const paymentId = 'pay_auth_error';
+    const res = await request({
+      razorpay_order_id: razorpayOrderId,
+      razorpay_payment_id: paymentId,
+      razorpay_signature: signatureFor(razorpayOrderId, paymentId)
+    });
+
+    expect(res.status).toBe(502);
+  });
+
+  it('returns 502 for network errors (e.g. ECONNRESET)', async () => {
+    const paymentId = 'pay_econnreset';
     const res = await request({
       razorpay_order_id: razorpayOrderId,
       razorpay_payment_id: paymentId,

@@ -10,6 +10,20 @@ import Razorpay from 'razorpay';
 import { markPaidAndEnroll, type VerifiedPayment } from '@cio/core/services/course/payment';
 import { enrollStudentInCourseTransaction, runPostCommitSideEffects } from '../../services/course/payment';
 
+function classifyRazorpayPaymentFetchError(err: any): AppError {
+  if (err?.statusCode === 404) {
+    return new AppError('Payment not found in provider', ErrorCodes.NOT_FOUND, 404);
+  }
+  if (
+    err?.error?.code === 'BAD_REQUEST_ERROR' &&
+    typeof err?.error?.description === 'string' &&
+    err.error.description.includes('exist')
+  ) {
+    return new AppError('Payment not found in provider', ErrorCodes.NOT_FOUND, 404);
+  }
+  return new AppError('Failed to verify payment with provider', ErrorCodes.INTERNAL_ERROR, 502);
+}
+
 export const verifyRouter = new Hono().post('/orders/:orderId/verify', authMiddleware, async (c) => {
   try {
     const orderId = c.req.param('orderId');
@@ -81,10 +95,7 @@ export const verifyRouter = new Hono().post('/orders/:orderId/verify', authMiddl
     try {
       payment = await razorpay.payments.fetch(razorpay_payment_id);
     } catch (err: any) {
-      if (err?.statusCode === 404 || err?.error?.code === 'BAD_REQUEST_ERROR') {
-        throw new AppError('Payment not found in provider', ErrorCodes.NOT_FOUND, 404);
-      }
-      throw new AppError('Failed to verify payment with provider', ErrorCodes.INTERNAL_ERROR, 502);
+      throw classifyRazorpayPaymentFetchError(err);
     }
 
     if (payment.id !== razorpay_payment_id) {
