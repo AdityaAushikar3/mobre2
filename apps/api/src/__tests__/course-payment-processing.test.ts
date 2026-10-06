@@ -765,5 +765,196 @@ describe('Course Payment Processing State Machine', () => {
       expect(ids).toContain(paymentA.id);
       expect(ids).toContain(paymentB.id);
     });
+    describe('non-captured payments never mutate order state', () => {
+      async function getOrderSnapshot(orderId: string) {
+        const [order] = await db
+          .select()
+          .from(schema.courseOrder)
+          .where(eq(schema.courseOrder.razorpayOrderId, orderId));
+        return {
+          status: order.status,
+          razorpayPaymentId: order.razorpayPaymentId,
+          needsAttention: order.needsAttention,
+          attentionReason: order.attentionReason,
+          attentionPaymentIds: order.attentionPaymentIds,
+          paidAt: order.paidAt,
+          updatedAt: order.updatedAt
+        };
+      }
+
+      async function getMembershipCounts() {
+        const groupRes = await db
+          .select()
+          .from(schema.groupmember)
+          .where(and(eq(schema.groupmember.groupId, groupId), eq(schema.groupmember.profileId, userId)));
+        const orgRes = await db
+          .select()
+          .from(schema.organizationmember)
+          .where(
+            and(eq(schema.organizationmember.organizationId, orgId), eq(schema.organizationmember.profileId, userId))
+          );
+        return { groupCount: groupRes.length, orgCount: orgRes.length };
+      }
+
+      // a. CREATED order, razorpayPaymentId NULL, needsAttention false, matching amount and currency.
+      it('rejects on CREATED order without mutations (status: authorized)', async () => {
+        const orderId = `order_auth_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+        await insertOrder({ razorpayOrderId: orderId });
+        const snapshot = await getOrderSnapshot(orderId);
+        const memberships = await getMembershipCounts();
+        const enrollFn = vi.fn();
+
+        const payment = makePayment({
+          id: `pay_${crypto.randomUUID()}`,
+          razorpayOrderId: orderId,
+          status: 'authorized'
+        });
+
+        await expect(markPaidAndEnroll(payment, enrollFn)).rejects.toThrow(/Payment is not captured/);
+
+        expect(await getOrderSnapshot(orderId)).toEqual(snapshot);
+        expect(enrollFn).not.toHaveBeenCalled();
+        expect(await getMembershipCounts()).toEqual(memberships);
+      });
+
+      // a. Repeat with status: 'failed'
+      it('rejects on CREATED order without mutations (status: failed)', async () => {
+        const orderId = `order_fail_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+        await insertOrder({ razorpayOrderId: orderId });
+        const snapshot = await getOrderSnapshot(orderId);
+        const memberships = await getMembershipCounts();
+        const enrollFn = vi.fn();
+
+        const payment = makePayment({ id: `pay_${crypto.randomUUID()}`, razorpayOrderId: orderId, status: 'failed' });
+
+        await expect(markPaidAndEnroll(payment, enrollFn)).rejects.toThrow(/Payment is not captured/);
+
+        expect(await getOrderSnapshot(orderId)).toEqual(snapshot);
+        expect(enrollFn).not.toHaveBeenCalled();
+        expect(await getMembershipCounts()).toEqual(memberships);
+      });
+
+      // b. PAID order with razorpayPaymentId = payA, paidAt set. Incoming is payB, non-captured.
+      it('rejects on PAID order with different payment without mutations', async () => {
+        const orderId = `order_paid_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+        const payA = `pay_${crypto.randomUUID()}`;
+        await insertOrder({
+          razorpayOrderId: orderId,
+          status: 'PAID',
+          razorpayPaymentId: payA,
+          paidAt: new Date().toISOString()
+        });
+        const snapshot = await getOrderSnapshot(orderId);
+        const memberships = await getMembershipCounts();
+        const enrollFn = vi.fn();
+
+        const payB = `pay_${crypto.randomUUID()}`;
+        const payment = makePayment({ id: payB, razorpayOrderId: orderId, status: 'authorized' });
+
+        await expect(markPaidAndEnroll(payment, enrollFn)).rejects.toThrow(/Payment is not captured/);
+
+        expect(await getOrderSnapshot(orderId)).toEqual(snapshot);
+        expect(enrollFn).not.toHaveBeenCalled();
+        expect(await getMembershipCounts()).toEqual(memberships);
+      });
+
+      // c. CREATED order with recorded razorpayPaymentId = payA, needsAttention=true, attentionReason=AMOUNT_MISMATCH. Incoming payB, non-captured.
+      it('rejects on CREATED order with different recorded payment and amount mismatch without mutations', async () => {
+        const orderId = `order_amt_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+        const payA = `pay_${crypto.randomUUID()}`;
+        await insertOrder({
+          razorpayOrderId: orderId,
+          status: 'CREATED',
+          razorpayPaymentId: payA,
+          needsAttention: true,
+          attentionReason: 'AMOUNT_MISMATCH'
+        });
+        const snapshot = await getOrderSnapshot(orderId);
+        const memberships = await getMembershipCounts();
+        const enrollFn = vi.fn();
+
+        const payB = `pay_${crypto.randomUUID()}`;
+        const payment = makePayment({ id: payB, razorpayOrderId: orderId, status: 'authorized' });
+
+        await expect(markPaidAndEnroll(payment, enrollFn)).rejects.toThrow(/Payment is not captured/);
+
+        expect(await getOrderSnapshot(orderId)).toEqual(snapshot);
+        expect(enrollFn).not.toHaveBeenCalled();
+        expect(await getMembershipCounts()).toEqual(memberships);
+      });
+
+      // d. Superseded order: CREATED, needsAttention=true, attentionReason=AMOUNT_MISMATCH, razorpayPaymentId NULL, attentionPaymentIds empty. Incoming non-captured.
+      it('rejects on superseded order without mutations', async () => {
+        const orderId = `order_sup_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+        await insertOrder({
+          razorpayOrderId: orderId,
+          status: 'CREATED',
+          razorpayPaymentId: null,
+          needsAttention: true,
+          attentionReason: 'AMOUNT_MISMATCH',
+          attentionPaymentIds: []
+        });
+        const snapshot = await getOrderSnapshot(orderId);
+        const memberships = await getMembershipCounts();
+        const enrollFn = vi.fn();
+
+        const payment = makePayment({
+          id: `pay_${crypto.randomUUID()}`,
+          razorpayOrderId: orderId,
+          status: 'authorized'
+        });
+
+        await expect(markPaidAndEnroll(payment, enrollFn)).rejects.toThrow(/Payment is not captured/);
+
+        expect(await getOrderSnapshot(orderId)).toEqual(snapshot);
+        expect(enrollFn).not.toHaveBeenCalled();
+        expect(await getMembershipCounts()).toEqual(memberships);
+      });
+
+      // e1. PAID order with razorpayPaymentId = payA. Incoming non-captured payA.
+      it('resolves as no-op on PAID order with matching payment', async () => {
+        const orderId = `order_pe1_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+        const payA = `pay_${crypto.randomUUID()}`;
+        await insertOrder({
+          razorpayOrderId: orderId,
+          status: 'PAID',
+          razorpayPaymentId: payA,
+          paidAt: new Date().toISOString()
+        });
+        const snapshot = await getOrderSnapshot(orderId);
+        const memberships = await getMembershipCounts();
+        const enrollFn = vi.fn();
+
+        const payment = makePayment({ id: payA, razorpayOrderId: orderId, status: 'authorized' });
+
+        const result = await markPaidAndEnroll(payment, enrollFn);
+        expect(result.handled).toBe(true);
+        expect(result.alreadyEnrolled).toBe(false);
+
+        expect(await getOrderSnapshot(orderId)).toEqual(snapshot);
+        expect(enrollFn).not.toHaveBeenCalled();
+        expect(await getMembershipCounts()).toEqual(memberships);
+      });
+
+      // e2. CREATED order with recorded razorpayPaymentId = payA. Incoming non-captured payA.
+      it('resolves as no-op on CREATED order with matching payment', async () => {
+        const orderId = `order_ce2_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+        const payA = `pay_${crypto.randomUUID()}`;
+        await insertOrder({ razorpayOrderId: orderId, status: 'CREATED', razorpayPaymentId: payA });
+        const snapshot = await getOrderSnapshot(orderId);
+        const memberships = await getMembershipCounts();
+        const enrollFn = vi.fn();
+
+        const payment = makePayment({ id: payA, razorpayOrderId: orderId, status: 'authorized' });
+
+        const result = await markPaidAndEnroll(payment, enrollFn);
+        expect(result.handled).toBe(true);
+        expect(result.alreadyEnrolled).toBe(false);
+
+        expect(await getOrderSnapshot(orderId)).toEqual(snapshot);
+        expect(enrollFn).not.toHaveBeenCalled();
+        expect(await getMembershipCounts()).toEqual(memberships);
+      });
+    });
   });
 });
