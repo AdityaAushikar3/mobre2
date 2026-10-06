@@ -34,6 +34,21 @@ vi.mock('razorpay', () => ({
 
         if (paymentId === 'pay_bad_request_not_found') {
           const error: any = new Error('Bad request');
+          error.statusCode = 400;
+          error.error = { code: 'BAD_REQUEST_ERROR', description: 'payment does not exist' };
+          throw error;
+        }
+
+        if (paymentId === 'pay_bad_request_already_exists') {
+          const error: any = new Error('Bad request');
+          error.statusCode = 400;
+          error.error = { code: 'BAD_REQUEST_ERROR', description: 'payment already exists' };
+          throw error;
+        }
+
+        if (paymentId === 'pay_401_bad_request') {
+          const error: any = new Error('Unauthorized');
+          error.statusCode = 401;
           error.error = { code: 'BAD_REQUEST_ERROR', description: 'payment does not exist' };
           throw error;
         }
@@ -379,6 +394,28 @@ describe('Course payment verification route', () => {
     });
 
     expect(res.status).toBe(404);
+  });
+
+  it('returns 502 for BAD_REQUEST_ERROR when payment already exists', async () => {
+    const paymentId = 'pay_bad_request_already_exists';
+    const res = await request({
+      razorpay_order_id: razorpayOrderId,
+      razorpay_payment_id: paymentId,
+      razorpay_signature: signatureFor(razorpayOrderId, paymentId)
+    });
+
+    expect(res.status).toBe(502);
+  });
+
+  it('returns 502 for 401 even if description says payment does not exist', async () => {
+    const paymentId = 'pay_401_bad_request';
+    const res = await request({
+      razorpay_order_id: razorpayOrderId,
+      razorpay_payment_id: paymentId,
+      razorpay_signature: signatureFor(razorpayOrderId, paymentId)
+    });
+
+    expect(res.status).toBe(502);
   });
 
   it('returns 502 for 401 authentication error', async () => {

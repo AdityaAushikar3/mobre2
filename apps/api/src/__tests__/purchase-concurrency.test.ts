@@ -203,7 +203,7 @@ describe('Course Purchase Concurrency & State', () => {
         amountPaise: 50000,
         currency: 'INR',
         razorpayOrderId: blockedOrderId,
-        razorpayPaymentId: 'pay_xyz123',
+        razorpayPaymentId: `pay_${crypto.randomUUID()}`,
         status: 'CREATED',
         needsAttention: false
       });

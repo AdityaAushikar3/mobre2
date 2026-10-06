@@ -145,23 +145,25 @@ describe('Course Payment Processing State Machine', () => {
     });
 
     it('PAID + different payment preserves original and raises DUPLICATE_PAYMENT attention', async () => {
+      const originalId = `pay_${crypto.randomUUID()}`;
+      const duplicateId = `pay_${crypto.randomUUID()}`;
       await insertOrder({
         status: 'PAID',
-        razorpayPaymentId: 'pay_original',
+        razorpayPaymentId: originalId,
         needsAttention: false
       });
 
-      const incoming = makePayment({ id: 'pay_duplicate' });
+      const incoming = makePayment({ id: duplicateId });
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
       try {
         const result = await markPaidAndEnroll(incoming, vi.fn());
 
         expect(result.handled).toBe(true);
-        expect(result.order.razorpayPaymentId).toBe('pay_original');
+        expect(result.order.razorpayPaymentId).toBe(originalId);
         expect(result.order.needsAttention).toBe(true);
         expect(result.order.attentionReason).toBe('DUPLICATE_PAYMENT');
-        expect(result.order.attentionPaymentIds).toContain('pay_duplicate');
+        expect(result.order.attentionPaymentIds).toContain(duplicateId);
         expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('[DUPLICATE_PAYMENT]'));
       } finally {
         errorSpy.mockRestore();
@@ -169,25 +171,28 @@ describe('Course Payment Processing State Machine', () => {
     });
 
     it('CREATED + same existing payment is a locked idempotent no-op and never becomes PAID', async () => {
+      const existingId = `pay_${crypto.randomUUID()}`;
       await insertOrder({
-        razorpayPaymentId: 'pay_existing',
+        razorpayPaymentId: existingId,
         status: 'CREATED'
       });
 
-      const result = await markPaidAndEnroll(makePayment({ id: 'pay_existing' }), vi.fn());
+      const result = await markPaidAndEnroll(makePayment({ id: existingId }), vi.fn());
 
       expect(result.handled).toBe(true);
       expect(result.order.status).toBe('CREATED');
-      expect(result.order.razorpayPaymentId).toBe('pay_existing');
+      expect(result.order.razorpayPaymentId).toBe(existingId);
     });
 
     it('CREATED + different existing payment preserves original and sets DUPLICATE_PAYMENT', async () => {
+      const existingId = `pay_${crypto.randomUUID()}`;
+      const differentId = `pay_${crypto.randomUUID()}`;
       await insertOrder({
-        razorpayPaymentId: 'pay_existing',
+        razorpayPaymentId: existingId,
         status: 'CREATED'
       });
 
-      const incoming = makePayment({ id: 'pay_different' });
+      const incoming = makePayment({ id: differentId });
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
       try {
@@ -195,10 +200,10 @@ describe('Course Payment Processing State Machine', () => {
 
         expect(result.handled).toBe(true);
         expect(result.order.status).toBe('CREATED');
-        expect(result.order.razorpayPaymentId).toBe('pay_existing');
+        expect(result.order.razorpayPaymentId).toBe(existingId);
         expect(result.order.needsAttention).toBe(true);
         expect(result.order.attentionReason).toBe('DUPLICATE_PAYMENT');
-        expect(result.order.attentionPaymentIds).toContain('pay_different');
+        expect(result.order.attentionPaymentIds).toContain(differentId);
         expect(errorSpy).toHaveBeenCalled();
       } finally {
         errorSpy.mockRestore();
@@ -236,16 +241,17 @@ describe('Course Payment Processing State Machine', () => {
         attentionReason: 'AMOUNT_MISMATCH'
       });
 
+      const supersededId = `pay_${crypto.randomUUID()}`;
       const enrollFn = vi.fn();
-      const payment = makePayment({ id: 'pay_superseded' });
+      const payment = makePayment({ id: supersededId });
       const result = await markPaidAndEnroll(payment, enrollFn);
 
       expect(result.handled).toBe(true);
       expect(result.order.status).toBe('CREATED');
       expect(result.order.needsAttention).toBe(true);
       expect(result.order.attentionReason).toBe('AMOUNT_MISMATCH');
-      expect(result.order.razorpayPaymentId).toBe('pay_superseded');
-      expect(result.order.attentionPaymentIds).toContain('pay_superseded');
+      expect(result.order.razorpayPaymentId).toBe(supersededId);
+      expect(result.order.attentionPaymentIds).toContain(supersededId);
       expect(enrollFn).not.toHaveBeenCalled();
     });
 
@@ -255,7 +261,9 @@ describe('Course Payment Processing State Machine', () => {
         attentionReason: 'ENROLLMENT_FAILED'
       });
 
-      const failed = makePayment({ id: 'pay_failed_attempt' });
+      const failedId = `pay_${crypto.randomUUID()}`;
+      const retryId = `pay_${crypto.randomUUID()}`;
+      const failed = makePayment({ id: failedId });
       await expect(
         markPaidAndEnroll(failed, vi.fn().mockRejectedValue(new Error('simulated enrollment failure')))
       ).rejects.toThrow('Payment verified but enrollment failed');
@@ -271,13 +279,13 @@ describe('Course Payment Processing State Machine', () => {
       expect(failedOrder.attentionReason).toBe('ENROLLMENT_FAILED');
 
       const retry = await markPaidAndEnroll(
-        makePayment({ id: 'pay_retry' }),
+        makePayment({ id: retryId }),
         vi.fn().mockResolvedValue({ retryEffect: true })
       );
 
       expect(retry.handled).toBe(true);
       expect(retry.order.status).toBe('PAID');
-      expect(retry.order.razorpayPaymentId).toBe('pay_retry');
+      expect(retry.order.razorpayPaymentId).toBe(retryId);
       expect(retry.order.needsAttention).toBe(false);
       expect(retry.order.attentionReason).toBeNull();
     });
@@ -551,6 +559,7 @@ describe('Course Payment Processing State Machine', () => {
     });
 
     it('real transaction rollback test', async () => {
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       const orderId = `order_rollback_${crypto.randomUUID()}`;
       await db.insert(schema.courseOrder).values({
         organizationId: orgId,
@@ -577,15 +586,29 @@ describe('Course Payment Processing State Machine', () => {
         await tx.insert(schema.organizationmember).values({
           organizationId: orgId,
           profileId: userId,
-          role: 'member'
+          roleId: ROLE.STUDENT
         });
 
         // Create a group member using the supplied tx
         await tx.insert(schema.groupmember).values({
           groupId: groupId,
           profileId: userId,
-          role: 'member'
+          roleId: ROLE.STUDENT
         });
+
+        const orgMembers = await tx
+          .select()
+          .from(schema.organizationmember)
+          .where(
+            and(eq(schema.organizationmember.organizationId, orgId), eq(schema.organizationmember.profileId, userId))
+          );
+        expect(orgMembers).toHaveLength(1);
+
+        const groupMembers = await tx
+          .select()
+          .from(schema.groupmember)
+          .where(and(eq(schema.groupmember.groupId, groupId), eq(schema.groupmember.profileId, userId)));
+        expect(groupMembers).toHaveLength(1);
 
         throw new Error('intentional rollback');
       };
@@ -593,6 +616,10 @@ describe('Course Payment Processing State Machine', () => {
       await expect(markPaidAndEnroll(payment, failingEnrollmentFunction)).rejects.toThrow(
         'Payment verified but enrollment failed. Please contact support.'
       );
+
+      const spyCalls = consoleErrorSpy.mock.calls.map((args) => args.join(' ')).join(' ');
+      expect(spyCalls).toContain('intentional rollback');
+      consoleErrorSpy.mockRestore();
 
       const [updatedOrder] = await db
         .select()
@@ -619,6 +646,124 @@ describe('Course Payment Processing State Machine', () => {
           and(eq(schema.organizationmember.organizationId, orgId), eq(schema.organizationmember.profileId, userId))
         );
       expect(orgMemberships).toHaveLength(0);
+    });
+    it('failure traceability - sequential failures', async () => {
+      const orderId = `order_seq_${crypto.randomUUID()}`;
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: orderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const failingFn = async () => {
+        throw new Error('fail');
+      };
+
+      const paymentA = {
+        id: `pay_${crypto.randomUUID()}`,
+        razorpayOrderId: orderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+      const paymentB = {
+        id: `pay_${crypto.randomUUID()}`,
+        razorpayOrderId: orderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      await expect(markPaidAndEnroll(paymentA as any, failingFn)).rejects.toThrow();
+      await expect(markPaidAndEnroll(paymentB as any, failingFn)).rejects.toThrow();
+
+      const [order] = await db.select().from(schema.courseOrder).where(eq(schema.courseOrder.razorpayOrderId, orderId));
+      expect(order.status).toBe('CREATED');
+      expect(order.razorpayPaymentId).toBeNull();
+      expect(order.needsAttention).toBe(true);
+      expect(order.attentionReason).toBe('ENROLLMENT_FAILED');
+      expect(order.attentionPaymentIds as string[]).toContain(paymentA.id);
+      expect(order.attentionPaymentIds as string[]).toContain(paymentB.id);
+    });
+
+    it('failure traceability - same ID repeated', async () => {
+      const orderId = `order_same_${crypto.randomUUID()}`;
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: orderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const failingFn = async () => {
+        throw new Error('fail');
+      };
+      const paymentId = `pay_${crypto.randomUUID()}`;
+      const payment = {
+        id: paymentId,
+        razorpayOrderId: orderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      await expect(markPaidAndEnroll(payment as any, failingFn)).rejects.toThrow();
+      await expect(markPaidAndEnroll(payment as any, failingFn)).rejects.toThrow();
+
+      const [order] = await db.select().from(schema.courseOrder).where(eq(schema.courseOrder.razorpayOrderId, orderId));
+      const ids = order.attentionPaymentIds as string[];
+      expect(ids.filter((id) => id === paymentId)).toHaveLength(1);
+    });
+
+    it('failure traceability - concurrent failures', async () => {
+      const orderId = `order_conc_${crypto.randomUUID()}`;
+      await db.insert(schema.courseOrder).values({
+        organizationId: orgId,
+        userId: userId,
+        courseId: courseId,
+        amountPaise: 50000,
+        currency: 'INR',
+        razorpayOrderId: orderId,
+        status: 'CREATED',
+        needsAttention: false
+      });
+
+      const failingFn = async () => {
+        throw new Error('fail');
+      };
+      const paymentA = {
+        id: `pay_${crypto.randomUUID()}`,
+        razorpayOrderId: orderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+      const paymentB = {
+        id: `pay_${crypto.randomUUID()}`,
+        razorpayOrderId: orderId,
+        status: 'captured',
+        amountPaise: 50000,
+        currency: 'INR'
+      };
+
+      await Promise.all([
+        markPaidAndEnroll(paymentA as any, failingFn).catch(() => {}),
+        markPaidAndEnroll(paymentB as any, failingFn).catch(() => {})
+      ]);
+
+      const [order] = await db.select().from(schema.courseOrder).where(eq(schema.courseOrder.razorpayOrderId, orderId));
+      const ids = order.attentionPaymentIds as string[];
+      expect(ids).toContain(paymentA.id);
+      expect(ids).toContain(paymentB.id);
     });
   });
 });

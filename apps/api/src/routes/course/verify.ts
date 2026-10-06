@@ -15,9 +15,9 @@ function classifyRazorpayPaymentFetchError(err: any): AppError {
     return new AppError('Payment not found in provider', ErrorCodes.NOT_FOUND, 404);
   }
   if (
-    err?.error?.code === 'BAD_REQUEST_ERROR' &&
+    err?.statusCode === 400 &&
     typeof err?.error?.description === 'string' &&
-    err.error.description.includes('exist')
+    /does not exist/i.test(err.error.description)
   ) {
     return new AppError('Payment not found in provider', ErrorCodes.NOT_FOUND, 404);
   }

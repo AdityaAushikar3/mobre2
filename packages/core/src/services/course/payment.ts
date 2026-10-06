@@ -69,6 +69,13 @@ export async function markPaidAndEnroll(
         throw new AppError('Course or group not found', ErrorCodes.VALIDATION_ERROR, 400);
       }
 
+      if (payment.status !== 'captured') {
+        if (order.razorpayPaymentId === payment.id && (order.status === 'PAID' || order.status === 'CREATED')) {
+          return { handled: true, alreadyEnrolled: false, order };
+        }
+        throw new AppError('Payment is not captured', ErrorCodes.VALIDATION_ERROR, 400);
+      }
+
       // Case A: Order is already PAID
       if (order.status === 'PAID') {
         if (order.razorpayPaymentId === payment.id) {
@@ -162,10 +169,6 @@ export async function markPaidAndEnroll(
       // Note: If order was ENROLLMENT_FAILED, needsAttention is true and razorpayPaymentId is null.
       // This falls through to here naturally because we excluded attentionReason !== 'ENROLLMENT_FAILED' in Case F.
 
-      if (payment.status !== 'captured') {
-        throw new AppError('Payment is not captured', ErrorCodes.VALIDATION_ERROR, 400);
-      }
-
       if (payment.amountPaise !== order.amountPaise || payment.currency !== order.currency) {
         const existingPaymentIds = (order.attentionPaymentIds as string[]) ?? [];
         const updatedPaymentIds = existingPaymentIds.includes(payment.id)
@@ -222,20 +225,21 @@ export async function markPaidAndEnroll(
   } catch (error) {
     if (error instanceof EnrollmentFailedError && transactionRolledBack) {
       console.error(
-        `[ENROLLMENT_FAILED] Local Order: ${preOrder.id}, User: ${preOrder.userId}, Course: ${preOrder.courseId}, Razorpay Order: ${preOrder.razorpayOrderId}, Payment ID: ${payment.id}. Reason:`,
-        error.cause
+        `[ENROLLMENT_FAILED] Local Order: ${preOrder.id}, User: ${preOrder.userId}, Course: ${preOrder.courseId}, Razorpay Order: ${payment.razorpayOrderId}, Payment ID: ${payment.id}. Reason:`,
+        error.cause instanceof Error ? error.cause.message : String(error.cause)
       );
 
       try {
-        const existingIds = (preOrder.attentionPaymentIds as string[]) ?? [];
-        const updatedIds = existingIds.includes(payment.id) ? existingIds : [...existingIds, payment.id];
-
         const result = await db
           .update(schema.courseOrder)
           .set({
             needsAttention: true,
             attentionReason: 'ENROLLMENT_FAILED',
-            attentionPaymentIds: updatedIds,
+            attentionPaymentIds: sql`CASE
+  WHEN COALESCE(${schema.courseOrder.attentionPaymentIds}, '[]'::jsonb) @> to_jsonb(${payment.id}::text)
+  THEN COALESCE(${schema.courseOrder.attentionPaymentIds}, '[]'::jsonb)
+  ELSE COALESCE(${schema.courseOrder.attentionPaymentIds}, '[]'::jsonb) || to_jsonb(${payment.id}::text)
+END`,
             updatedAt: new Date().toISOString()
           })
           .where(
