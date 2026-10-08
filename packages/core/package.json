@@ -68,6 +68,7 @@
     "@types/pdf-parse": "^1.1.5",
     "tsc-alias": "^1.8.16",
     "tsx": "^4.7.1",
-    "typescript": "^5.5.2"
+    "typescript": "^5.5.2",
+    "vitest": "1.6.1"
   }
 }

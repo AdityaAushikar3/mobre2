@@ -4329,3 +4329,25 @@ export const courseOrder = pgTable(
     index('idx_course_order_user_course').on(table.userId, table.courseId)
   ]
 );
+
+export const razorpayWebhookEventStatus = pgEnum('RAZORPAY_WEBHOOK_EVENT_STATUS', [
+  'PROCESSING',
+  'PROCESSED',
+  'IGNORED',
+  'FAILED'
+]);
+
+export const razorpayWebhookEvent = pgTable('razorpay_webhook_event', {
+  id: uuid()
+    .default(sql`gen_random_uuid()`)
+    .primaryKey()
+    .notNull(),
+  providerEventId: text('provider_event_id').notNull().unique(),
+  eventType: text('event_type').notNull(),
+  status: razorpayWebhookEventStatus('status').notNull(),
+  razorpayOrderId: text('razorpay_order_id'),
+  razorpayPaymentId: text('razorpay_payment_id'),
+  detail: text('detail'),
+  createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'string' }).defaultNow().notNull()
+});

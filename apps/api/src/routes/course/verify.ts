@@ -6,23 +6,9 @@ import * as schema from '@cio/db/schema';
 import { eq } from 'drizzle-orm';
 import crypto from 'node:crypto';
 import { env } from '@cio/core/config/env';
-import Razorpay from 'razorpay';
-import { markPaidAndEnroll, type VerifiedPayment } from '@cio/core/services/course/payment';
+import { markPaidAndEnroll } from '@cio/core/services/course/payment';
 import { enrollStudentInCourseTransaction, runPostCommitSideEffects } from '../../services/course/payment';
-
-function classifyRazorpayPaymentFetchError(err: any): AppError {
-  if (err?.statusCode === 404) {
-    return new AppError('Payment not found in provider', ErrorCodes.NOT_FOUND, 404);
-  }
-  if (
-    err?.statusCode === 400 &&
-    typeof err?.error?.description === 'string' &&
-    /does not exist/i.test(err.error.description)
-  ) {
-    return new AppError('Payment not found in provider', ErrorCodes.NOT_FOUND, 404);
-  }
-  return new AppError('Failed to verify payment with provider', ErrorCodes.INTERNAL_ERROR, 502);
-}
+import { verifyProviderPayment } from '@cio/core/services/course/razorpay';
 
 export const verifyRouter = new Hono().post('/orders/:orderId/verify', authMiddleware, async (c) => {
   try {
@@ -86,41 +72,18 @@ export const verifyRouter = new Hono().post('/orders/:orderId/verify', authMiddl
       throw new AppError('Invalid payment signature', ErrorCodes.VALIDATION_ERROR, 400);
     }
 
-    const razorpay = new Razorpay({
-      key_id: env.RAZORPAY_KEY_ID,
-      key_secret: env.RAZORPAY_KEY_SECRET
+    const verifiedPayment = await verifyProviderPayment({
+      razorpayOrderId: razorpay_order_id,
+      razorpayPaymentId: razorpay_payment_id
     });
 
-    let payment;
-    try {
-      payment = await razorpay.payments.fetch(razorpay_payment_id);
-    } catch (err: any) {
-      throw classifyRazorpayPaymentFetchError(err);
-    }
-
-    if (payment.id !== razorpay_payment_id) {
-      throw new AppError('Provider payment ID does not match requested payment ID', ErrorCodes.VALIDATION_ERROR, 400);
-    }
-
-    if (payment.order_id !== razorpay_order_id) {
-      throw new AppError('Payment does not belong to the expected order', ErrorCodes.VALIDATION_ERROR, 400);
-    }
-
-    if (payment.status === 'failed') {
+    if (verifiedPayment.status === 'failed') {
       return c.json({ success: false, status: 'FAILED', message: 'Payment has failed' }, 400);
     }
 
-    if (payment.status !== 'captured') {
+    if (verifiedPayment.status !== 'captured') {
       return c.json({ success: true, status: 'PENDING', message: 'Payment is pending capture' });
     }
-
-    const verifiedPayment: VerifiedPayment = {
-      id: payment.id,
-      razorpayOrderId: payment.order_id,
-      status: payment.status,
-      amountPaise: payment.amount as number,
-      currency: payment.currency
-    };
 
     const result = await markPaidAndEnroll(verifiedPayment, enrollStudentInCourseTransaction);
 
