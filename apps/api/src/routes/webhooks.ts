@@ -11,8 +11,25 @@ import { verifyProviderPayment } from '@cio/core/services/course/razorpay';
 import { markPaidAndEnroll } from '@cio/core/services/course/payment';
 import { enrollStudentInCourseTransaction, runPostCommitSideEffects } from '../services/course/payment';
 import { handleError } from '@api/utils/errors';
+import * as Sentry from '@sentry/node';
 
 const RAZORPAY_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024; // 1 MiB
+
+function createSanitizedWebhookError(safeDetail: string, originalError: unknown): Error {
+  const sanitizedError = new Error(`[Sanitized] ${safeDetail}`);
+  sanitizedError.name = 'WebhookProcessingError';
+
+  if (originalError instanceof Error && originalError.stack) {
+    const stackLines = originalError.stack.split('\n');
+
+    // Preserve only stack frames, never the original stack/message first line.
+    if (stackLines.length > 1) {
+      sanitizedError.stack = [sanitizedError.toString(), ...stackLines.slice(1)].join('\n');
+    }
+  }
+
+  return sanitizedError;
+}
 
 export const webhooksRouter = new Hono()
   .onError((err, c) => handleError(c, err))
@@ -138,8 +155,9 @@ export const webhooksRouter = new Hono()
           if (result.effects) {
             try {
               await runPostCommitSideEffects(result.effects);
-            } catch (err) {
-              console.error('Fatal error in side effects (should be caught internally):', err);
+            } catch {
+              console.error('Fatal error in webhook post-commit side effects');
+              Sentry.captureMessage('Webhook post-commit side effects failed', 'error');
             }
           }
 
@@ -167,7 +185,12 @@ export const webhooksRouter = new Hono()
         return c.json({ success: true, message: 'Event received' });
       } catch (error) {
         let safeDetail = 'Webhook processing failed';
+        let statusCode = 500;
+        let errorCode: string = ErrorCodes.INTERNAL_ERROR;
+
         if (error instanceof AppError) {
+          statusCode = error.statusCode;
+          errorCode = error.code;
           if (error.statusCode === 502) safeDetail = 'Provider verification failed';
           else if (error.statusCode >= 400 && error.statusCode < 500) safeDetail = 'Validation failed';
           else safeDetail = 'Unexpected processing error';
@@ -176,7 +199,13 @@ export const webhooksRouter = new Hono()
         }
 
         await resolveRazorpayWebhookEvent(claim.eventId, 'FAILED', safeDetail, claim.processingLeaseId);
-        throw error;
+
+        if (statusCode >= 500) {
+          const sanitizedError = createSanitizedWebhookError(safeDetail, error);
+          Sentry.captureException(sanitizedError);
+        }
+
+        throw new AppError(safeDetail, errorCode, statusCode);
       }
     }
   );

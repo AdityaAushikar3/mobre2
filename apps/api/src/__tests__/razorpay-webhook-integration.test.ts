@@ -20,6 +20,7 @@ import * as schema from '@cio/db/schema';
 import { eq, and, inArray } from 'drizzle-orm';
 import * as razorpayService from '@cio/core/services/course/razorpay';
 import crypto from 'node:crypto';
+import * as Sentry from '@sentry/node';
 
 vi.mock('@cio/core/config/env', () => ({
   env: {
@@ -27,6 +28,13 @@ vi.mock('@cio/core/config/env', () => ({
     RAZORPAY_KEY_ID: 'test_key',
     RAZORPAY_KEY_SECRET: 'test_key_secret'
   }
+}));
+
+vi.mock('@sentry/node', () => ({
+  captureException: vi.fn(),
+  setUser: vi.fn(),
+  init: vi.fn(),
+  flush: vi.fn().mockResolvedValue(true)
 }));
 
 describe('Razorpay Webhook Integration', () => {
@@ -969,5 +977,99 @@ describe('Razorpay Webhook Integration', () => {
     expect(event.detail).not.toContain('SECRET_VALUE');
     expect(event.detail).not.toContain('internal-host');
     expect(event.detail).toBe('Webhook processing failed'); // sanitized, not raw error
+
+    expect(Sentry.captureException).toHaveBeenCalled();
+    const capturedError = vi.mocked(Sentry.captureException).mock.calls[0][0] as Error;
+    expect(capturedError).toBeInstanceOf(Error);
+    expect(capturedError.message).not.toContain('SECRET_VALUE');
+    expect(capturedError.message).not.toContain('internal-host');
+    expect(capturedError.stack).not.toContain('SECRET_VALUE');
+    expect(capturedError.stack).not.toContain('internal-host');
+    expect(capturedError.message).toContain('[Sanitized] Webhook processing failed');
+  });
+
+  it('14U. Sanitizes AppError and does not leak sensitive information to Sentry', async () => {
+    vi.clearAllMocks();
+    const razorpayOrderId = 'order_test_sanitization_apperror';
+    const razorpayPaymentId = 'pay_test_sanitization_apperror';
+    const eventId = createEventId();
+
+    await createLocalOrder(razorpayOrderId);
+
+    vi.spyOn(razorpayService, 'verifyProviderPayment').mockRejectedValue(
+      new AppError('DB password=SECRET_VALUE host=internal-host', 'INTERNAL_ERROR', 500)
+    );
+
+    const payload = JSON.stringify({
+      event: 'order.paid',
+      payload: { payment: { entity: { id: razorpayPaymentId, order_id: razorpayOrderId } } }
+    });
+    const signature = generateSignature(payload);
+
+    await app.request('/public-api/webhooks/razorpay', {
+      method: 'POST',
+      headers: {
+        'X-Razorpay-Signature': signature,
+        'X-Razorpay-Event-Id': eventId
+      },
+      body: payload
+    });
+
+    expect(Sentry.captureException).toHaveBeenCalled();
+    const capturedError = vi.mocked(Sentry.captureException).mock.calls[0][0] as Error;
+    expect(capturedError.message).not.toContain('SECRET_VALUE');
+    expect(capturedError.message).not.toContain('internal-host');
+    expect(capturedError.stack).not.toContain('SECRET_VALUE');
+    expect(capturedError.stack).not.toContain('internal-host');
+  });
+
+  it('14V. Sanitizes post-commit side-effect errors in logs', async () => {
+    vi.clearAllMocks();
+    const razorpayOrderId = 'order_test_sanitization_side_effect';
+    const razorpayPaymentId = 'pay_test_sanitization_side_effect';
+    const eventId = createEventId();
+
+    await createLocalOrder(razorpayOrderId);
+
+    vi.spyOn(razorpayService, 'verifyProviderPayment').mockResolvedValue({
+      id: razorpayPaymentId,
+      razorpayOrderId,
+      status: 'captured',
+      amountPaise: 100000,
+      currency: 'INR'
+    });
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // Force an effect to fail
+    vi.mocked(paymentService.markPaidAndEnroll).mockResolvedValue({
+      handled: true,
+      alreadyEnrolled: false,
+      order: { id: 'order_123', razorpayOrderId: 'order_123' } as any,
+      effects: [{ type: 'TEST_EFFECT' }]
+    });
+
+    vi.mocked(paymentService.runPostCommitSideEffects).mockRejectedValue(
+      new Error('Failed effect due to db password=SECRET_VALUE')
+    );
+
+    const payload = JSON.stringify({
+      event: 'order.paid',
+      payload: { payment: { entity: { id: razorpayPaymentId, order_id: razorpayOrderId } } }
+    });
+    const signature = generateSignature(payload);
+
+    await app.request('/public-api/webhooks/razorpay', {
+      method: 'POST',
+      headers: {
+        'X-Razorpay-Signature': signature,
+        'X-Razorpay-Event-Id': eventId
+      },
+      body: payload
+    });
+
+    expect(consoleErrorSpy).toHaveBeenCalled();
+    const logCalls = consoleErrorSpy.mock.calls.map((args) => args.join(' ')).join(' ');
+    expect(logCalls).not.toContain('SECRET_VALUE');
   });
 });

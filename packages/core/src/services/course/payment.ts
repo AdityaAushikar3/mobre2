@@ -225,8 +225,7 @@ export async function markPaidAndEnroll(
   } catch (error) {
     if (error instanceof EnrollmentFailedError && transactionRolledBack) {
       console.error(
-        `[ENROLLMENT_FAILED] Local Order: ${preOrder.id}, User: ${preOrder.userId}, Course: ${preOrder.courseId}, Razorpay Order: ${payment.razorpayOrderId}, Payment ID: ${payment.id}. Reason:`,
-        error.cause instanceof Error ? error.cause.message : String(error.cause)
+        `[ENROLLMENT_FAILED] Local Order: ${preOrder.id}, User: ${preOrder.userId}, Course: ${preOrder.courseId}, Razorpay Order: ${payment.razorpayOrderId}, Payment ID: ${payment.id}.`
       );
 
       try {
@@ -256,8 +255,8 @@ END`,
             `[ENROLLMENT_FAILED] Order ${preOrder.id} changed state before failure marker could be persisted; refusing to overwrite current state.`
           );
         }
-      } catch (updateError) {
-        console.error(`Failed to update ENROLLMENT_FAILED for order ${preOrder.id}:`, updateError);
+      } catch {
+        console.error(`Failed to update ENROLLMENT_FAILED for order ${preOrder.id}`);
       }
 
       throw new AppError(
