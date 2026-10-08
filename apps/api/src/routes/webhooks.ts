@@ -112,12 +112,15 @@ export const webhooksRouter = new Hono()
             .limit(1);
 
           if (!order) {
-            await resolveRazorpayWebhookEvent(
+            const ignoreResult = await resolveRazorpayWebhookEvent(
               claim.eventId,
               'IGNORED',
               'No local course order found',
               claim.processingLeaseId
             );
+            if (ignoreResult.status === 'lost_lease') {
+              return c.json({ success: false, message: 'Webhook processing ownership was lost; retry required' }, 409);
+            }
             return c.json({ success: true, message: 'Acknowledged: Order not found locally' });
           }
 
@@ -140,14 +143,25 @@ export const webhooksRouter = new Hono()
             }
           }
 
-          await resolveRazorpayWebhookEvent(claim.eventId, 'PROCESSED', 'Payment fulfilled', claim.processingLeaseId);
+          const processedResult = await resolveRazorpayWebhookEvent(
+            claim.eventId,
+            'PROCESSED',
+            'Payment fulfilled',
+            claim.processingLeaseId
+          );
+          if (processedResult.status === 'lost_lease') {
+            return c.json({ success: false, message: 'Webhook processing ownership was lost; retry required' }, 409);
+          }
         } else {
-          await resolveRazorpayWebhookEvent(
+          const ignoredResult = await resolveRazorpayWebhookEvent(
             claim.eventId,
             'IGNORED',
             'Unsupported event type',
             claim.processingLeaseId
           );
+          if (ignoredResult.status === 'lost_lease') {
+            return c.json({ success: false, message: 'Webhook processing ownership was lost; retry required' }, 409);
+          }
         }
 
         return c.json({ success: true, message: 'Event received' });

@@ -17,7 +17,7 @@ import { env } from '@cio/core/config/env';
 import { createHmac } from 'crypto';
 import { db } from '@cio/db/drizzle';
 import * as schema from '@cio/db/schema';
-import { eq, and, like, inArray } from 'drizzle-orm';
+import { eq, and, inArray } from 'drizzle-orm';
 import * as razorpayService from '@cio/core/services/course/razorpay';
 import crypto from 'node:crypto';
 
@@ -903,6 +903,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14S. Reject request when signature contains invalid non-hex trailing characters', async () => {
     const payload = JSON.stringify({ event: 'order.paid' });
     const validSignature = generateSignature(payload);
+    const eventId = createEventId();
 
     // We add 'gg' which is not valid hex to the end of a valid 64-char hex string.
     const invalidSignature = validSignature + 'gg';
@@ -911,7 +912,7 @@ describe('Razorpay Webhook Integration', () => {
       method: 'POST',
       headers: {
         'X-Razorpay-Signature': invalidSignature,
-        'X-Razorpay-Event-Id': 'evt_test_invalid_sig'
+        'X-Razorpay-Event-Id': eventId
       },
       body: payload
     });
@@ -921,7 +922,52 @@ describe('Razorpay Webhook Integration', () => {
     const [event] = await db
       .select()
       .from(schema.razorpayWebhookEvent)
-      .where(eq(schema.razorpayWebhookEvent.providerEventId, 'evt_test_invalid_sig'));
+      .where(eq(schema.razorpayWebhookEvent.providerEventId, eventId));
     expect(event).toBeUndefined(); // Should not even be claimed
+  });
+
+  it('14T. Sanitizes error detail and does not leak sensitive information', async () => {
+    const razorpayOrderId = 'order_test_sanitization';
+    const razorpayPaymentId = 'pay_test_sanitization';
+    const eventId = createEventId();
+
+    await createLocalOrder(razorpayOrderId);
+
+    // Simulate an unexpected internal error with sensitive information
+    vi.spyOn(razorpayService, 'verifyProviderPayment').mockRejectedValue(
+      new Error('DB connection to internal-host:5432 failed; password=SECRET_VALUE')
+    );
+
+    const payload = JSON.stringify({
+      event: 'order.paid',
+      payload: { payment: { entity: { id: razorpayPaymentId, order_id: razorpayOrderId } } }
+    });
+    const signature = generateSignature(payload);
+
+    const res = await app.request('/public-api/webhooks/razorpay', {
+      method: 'POST',
+      headers: {
+        'X-Razorpay-Signature': signature,
+        'X-Razorpay-Event-Id': eventId
+      },
+      body: payload
+    });
+
+    // The error bubbles up to the error handler
+    expect(res.status).toBe(500);
+
+    const responseBody = await res.text();
+    expect(responseBody).not.toContain('SECRET_VALUE');
+    expect(responseBody).not.toContain('internal-host');
+
+    const [event] = await db
+      .select()
+      .from(schema.razorpayWebhookEvent)
+      .where(eq(schema.razorpayWebhookEvent.providerEventId, eventId));
+
+    expect(event.status).toBe('FAILED');
+    expect(event.detail).not.toContain('SECRET_VALUE');
+    expect(event.detail).not.toContain('internal-host');
+    expect(event.detail).toBe('Webhook processing failed'); // sanitized, not raw error
   });
 });

@@ -3,10 +3,15 @@ import { app } from '@api/app';
 import { env } from '@cio/core/config/env';
 import { createHmac } from 'crypto';
 import * as webhookClaim from '@cio/core/services/course/webhook-claim';
+import * as razorpayService from '@cio/core/services/course/razorpay';
 
 vi.mock('@cio/core/services/course/webhook-claim', () => ({
   claimRazorpayWebhookEvent: vi.fn(),
-  resolveRazorpayWebhookEvent: vi.fn()
+  resolveRazorpayWebhookEvent: vi.fn().mockResolvedValue({ status: 'resolved' })
+}));
+
+vi.mock('@cio/core/services/course/razorpay', () => ({
+  verifyProviderPayment: vi.fn()
 }));
 
 vi.mock('@cio/core/config/env', () => ({
@@ -156,6 +161,35 @@ describe('Razorpay Webhook Route', () => {
     });
 
     expect(res.status).toBe(200);
+    expect(webhookClaim.resolveRazorpayWebhookEvent).not.toHaveBeenCalled();
+  });
+
+  it('returns 409 for in_progress claim without calling resolve or provider', async () => {
+    const payload = JSON.stringify({
+      event: 'order.paid',
+      payload: { payment: { entity: { id: 'pay_456', order_id: 'order_456' } } }
+    });
+    const signature = generateSignature(payload);
+
+    vi.mocked(webhookClaim.claimRazorpayWebhookEvent).mockResolvedValue({
+      status: 'in_progress',
+      eventId: 'evt_456'
+    });
+
+    const res = await app.request('/public-api/webhooks/razorpay', {
+      method: 'POST',
+      headers: {
+        'X-Razorpay-Signature': signature,
+        'X-Razorpay-Event-Id': 'evt_456'
+      },
+      body: payload
+    });
+
+    expect(res.status).toBe(409);
+    const data = await res.json();
+    expect(data.message).toMatch(/retry/i);
+
+    // Must NOT call resolve or provider verification
     expect(webhookClaim.resolveRazorpayWebhookEvent).not.toHaveBeenCalled();
   });
 });
