@@ -87,15 +87,14 @@ export async function claimRazorpayWebhookEvent(
 export async function resolveRazorpayWebhookEvent(
   eventId: string,
   status: 'PROCESSED' | 'IGNORED' | 'FAILED',
-  detail?: string,
-  processingLeaseId?: string
+  detail: string | undefined,
+  processingLeaseId: string
 ) {
-  const conditions = [eq(razorpayWebhookEvent.id, eventId)];
-
-  if (processingLeaseId) {
-    conditions.push(eq(razorpayWebhookEvent.status, 'PROCESSING'));
-    conditions.push(eq(razorpayWebhookEvent.processingLeaseId, processingLeaseId));
-  }
+  const conditions = [
+    eq(razorpayWebhookEvent.id, eventId),
+    eq(razorpayWebhookEvent.status, 'PROCESSING'),
+    eq(razorpayWebhookEvent.processingLeaseId, processingLeaseId)
+  ];
 
   const [updated] = await db
     .update(razorpayWebhookEvent)
@@ -108,7 +107,7 @@ export async function resolveRazorpayWebhookEvent(
     .where(and(...conditions))
     .returning();
 
-  if (!updated && processingLeaseId) {
+  if (!updated) {
     return { status: 'lost_lease' };
   }
 

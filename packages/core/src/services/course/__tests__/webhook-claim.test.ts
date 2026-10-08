@@ -2,19 +2,25 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { claimRazorpayWebhookEvent, resolveRazorpayWebhookEvent, WEBHOOK_LEASE_MS } from '../webhook-claim';
 import { db } from '@cio/db/drizzle';
 import { razorpayWebhookEvent } from '@cio/db/schema';
-import { eq, like } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 
 describe('Webhook Claim Module', () => {
-  beforeEach(async () => {
-    await db.delete(razorpayWebhookEvent).where(like(razorpayWebhookEvent.providerEventId, 'evt_test%'));
+  let createdEventIds: string[] = [];
+
+  beforeEach(() => {
+    createdEventIds = [];
     vi.useFakeTimers({ toFake: ['Date'] });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    if (createdEventIds.length > 0) {
+      await db.delete(razorpayWebhookEvent).where(inArray(razorpayWebhookEvent.providerEventId, createdEventIds));
+    }
     vi.useRealTimers();
   });
 
   it('claims a new event successfully', async () => {
+    createdEventIds.push('evt_test1');
     const res = await claimRazorpayWebhookEvent('evt_test1', 'order.paid');
     expect(res.status).toBe('newly_claimed');
 
@@ -27,12 +33,14 @@ describe('Webhook Claim Module', () => {
   });
 
   it('returns in_progress for fresh PROCESSING event', async () => {
+    createdEventIds.push('evt_test2');
     await claimRazorpayWebhookEvent('evt_test2', 'order.paid');
     const res = await claimRazorpayWebhookEvent('evt_test2', 'order.paid');
     expect(res.status).toBe('in_progress');
   });
 
   it('reclaims stale PROCESSING event', async () => {
+    createdEventIds.push('evt_test3');
     const res1 = await claimRazorpayWebhookEvent('evt_test3', 'order.paid');
     expect(res1.status).toBe('newly_claimed');
 
@@ -45,22 +53,25 @@ describe('Webhook Claim Module', () => {
   });
 
   it('returns duplicate_done for PROCESSED event', async () => {
+    createdEventIds.push('evt_test4');
     const res1 = await claimRazorpayWebhookEvent('evt_test4', 'order.paid');
-    await resolveRazorpayWebhookEvent((res1 as any).eventId, 'PROCESSED');
+    await resolveRazorpayWebhookEvent((res1 as any).eventId, 'PROCESSED', undefined, (res1 as any).processingLeaseId);
 
     const res2 = await claimRazorpayWebhookEvent('evt_test4', 'order.paid');
     expect(res2.status).toBe('duplicate_done');
   });
 
   it('returns duplicate_done for IGNORED event', async () => {
+    createdEventIds.push('evt_test5');
     const res1 = await claimRazorpayWebhookEvent('evt_test5', 'order.paid');
-    await resolveRazorpayWebhookEvent((res1 as any).eventId, 'IGNORED');
+    await resolveRazorpayWebhookEvent((res1 as any).eventId, 'IGNORED', undefined, (res1 as any).processingLeaseId);
 
     const res2 = await claimRazorpayWebhookEvent('evt_test5', 'order.paid');
     expect(res2.status).toBe('duplicate_done');
   });
 
   it('prevents stale worker from overwriting state (Lease Ownership Race Fix)', async () => {
+    createdEventIds.push('evt_test6');
     // 1. Worker A claims event
     const resA = await claimRazorpayWebhookEvent('evt_test6', 'order.paid');
     expect(resA.status).toBe('newly_claimed');
@@ -91,6 +102,7 @@ describe('Webhook Claim Module', () => {
   });
 
   it('prevents stale worker from overwriting state (B fails, A cannot process)', async () => {
+    createdEventIds.push('evt_test7');
     // 1. Worker A claims event
     const resA = await claimRazorpayWebhookEvent('evt_test7', 'order.paid');
     const tokenA = (resA as any).processingLeaseId;

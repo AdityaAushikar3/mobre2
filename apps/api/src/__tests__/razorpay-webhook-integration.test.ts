@@ -17,7 +17,7 @@ import { env } from '@cio/core/config/env';
 import { createHmac } from 'crypto';
 import { db } from '@cio/db/drizzle';
 import * as schema from '@cio/db/schema';
-import { eq, and, like } from 'drizzle-orm';
+import { eq, and, like, inArray } from 'drizzle-orm';
 import * as razorpayService from '@cio/core/services/course/razorpay';
 import crypto from 'node:crypto';
 
@@ -30,6 +30,12 @@ vi.mock('@cio/core/config/env', () => ({
 }));
 
 describe('Razorpay Webhook Integration', () => {
+  let createdEventIds: string[] = [];
+  function createEventId() {
+    const id = crypto.randomUUID();
+    createdEventIds.push(id);
+    return id;
+  }
   let userId: string;
   let orgId: string;
   let courseId: string;
@@ -74,12 +80,13 @@ describe('Razorpay Webhook Integration', () => {
     await db.delete(schema.user).where(eq(schema.user.id, userId));
     await db.delete(schema.organization).where(eq(schema.organization.id, orgId));
 
-    // Clean up webhook events associated with test orders
-    await db
-      .delete(schema.razorpayWebhookEvent)
-      .where(like(schema.razorpayWebhookEvent.razorpayOrderId, 'order_webhook_%'));
-    // Also clean up webhooks with no order ID
-    await db.delete(schema.razorpayWebhookEvent).where(like(schema.razorpayWebhookEvent.providerEventId, 'evt_test_%'));
+    // Clean up exact webhook events created during the test
+    if (createdEventIds.length > 0) {
+      await db
+        .delete(schema.razorpayWebhookEvent)
+        .where(inArray(schema.razorpayWebhookEvent.providerEventId, createdEventIds));
+    }
+    createdEventIds = [];
   });
 
   function generateSignature(payload: string, secret: string = 'test_secret') {
@@ -104,7 +111,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14A. Successful webhook fulfillment', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
 
     await createLocalOrder(razorpayOrderId);
 
@@ -159,7 +166,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14B. Same webhook event repeated sequentially (idempotency)', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
     await createLocalOrder(razorpayOrderId);
 
     const verifySpy = vi.spyOn(razorpayService, 'verifyProviderPayment').mockResolvedValue({
@@ -202,7 +209,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14C. Same webhook event concurrently', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
     await createLocalOrder(razorpayOrderId);
 
     const verifySpy = vi.spyOn(razorpayService, 'verifyProviderPayment').mockResolvedValue({
@@ -267,7 +274,7 @@ describe('Razorpay Webhook Integration', () => {
     const signature = generateSignature(payload);
 
     // Event 1
-    const event1 = crypto.randomUUID();
+    const event1 = createEventId();
     await app.request('/public-api/webhooks/razorpay', {
       method: 'POST',
       headers: { 'X-Razorpay-Signature': signature, 'X-Razorpay-Event-Id': event1 },
@@ -275,7 +282,7 @@ describe('Razorpay Webhook Integration', () => {
     });
 
     // Event 2 (same payment, different webhook event ID)
-    const event2 = crypto.randomUUID();
+    const event2 = createEventId();
     await app.request('/public-api/webhooks/razorpay', {
       method: 'POST',
       headers: { 'X-Razorpay-Signature': signature, 'X-Razorpay-Event-Id': event2 },
@@ -312,7 +319,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14G. Provider verification failure', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
     await createLocalOrder(razorpayOrderId);
 
     vi.spyOn(razorpayService, 'verifyProviderPayment').mockRejectedValue(new Error('Provider failure'));
@@ -348,7 +355,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14H. Enrollment failure', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
     await createLocalOrder(razorpayOrderId);
 
     vi.spyOn(razorpayService, 'verifyProviderPayment').mockResolvedValue({
@@ -455,14 +462,14 @@ describe('Razorpay Webhook Integration', () => {
     // Event 1 (simulates Webhook)
     const req1 = app.request('/public-api/webhooks/razorpay', {
       method: 'POST',
-      headers: { 'X-Razorpay-Signature': signature, 'X-Razorpay-Event-Id': crypto.randomUUID() },
+      headers: { 'X-Razorpay-Signature': signature, 'X-Razorpay-Event-Id': createEventId() },
       body: payload
     });
 
     // Event 2 (another concurrent webhook delivery)
     const req2 = app.request('/public-api/webhooks/razorpay', {
       method: 'POST',
-      headers: { 'X-Razorpay-Signature': signature, 'X-Razorpay-Event-Id': crypto.randomUUID() },
+      headers: { 'X-Razorpay-Signature': signature, 'X-Razorpay-Event-Id': createEventId() },
       body: payload
     });
 
@@ -502,7 +509,7 @@ describe('Razorpay Webhook Integration', () => {
 
     await app.request('/public-api/webhooks/razorpay', {
       method: 'POST',
-      headers: { 'X-Razorpay-Signature': generateSignature(payload1), 'X-Razorpay-Event-Id': crypto.randomUUID() },
+      headers: { 'X-Razorpay-Signature': generateSignature(payload1), 'X-Razorpay-Event-Id': createEventId() },
       body: payload1
     });
 
@@ -522,7 +529,7 @@ describe('Razorpay Webhook Integration', () => {
 
     const res2 = await app.request('/public-api/webhooks/razorpay', {
       method: 'POST',
-      headers: { 'X-Razorpay-Signature': generateSignature(payload2), 'X-Razorpay-Event-Id': crypto.randomUUID() },
+      headers: { 'X-Razorpay-Signature': generateSignature(payload2), 'X-Razorpay-Event-Id': createEventId() },
       body: payload2
     });
 
@@ -542,7 +549,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14K. Provider payment not captured', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
     await createLocalOrder(razorpayOrderId);
 
     vi.spyOn(razorpayService, 'verifyProviderPayment').mockResolvedValue({
@@ -577,7 +584,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14L. Actual browser verify + webhook race', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
 
     // Create the actual order
     const [{ id: localOrderId }] = await db
@@ -651,7 +658,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14M. Real crash-style retry', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
     await createLocalOrder(razorpayOrderId);
 
     vi.spyOn(razorpayService, 'verifyProviderPayment').mockResolvedValue({
@@ -738,7 +745,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14N. Provider 404', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
     await createLocalOrder(razorpayOrderId);
 
     const { AppError, ErrorCodes } = await import('@cio/utils/errors');
@@ -775,7 +782,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14O. Provider mismatch', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
     await createLocalOrder(razorpayOrderId);
 
     // Mismatched order_id from provider
@@ -814,7 +821,7 @@ describe('Razorpay Webhook Integration', () => {
   it('14P. Provider 502 (Generic provider failure reaches webhook)', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
-    const eventId = crypto.randomUUID();
+    const eventId = createEventId();
     await createLocalOrder(razorpayOrderId);
 
     const { AppError, ErrorCodes } = await import('@cio/utils/errors');
@@ -857,7 +864,7 @@ describe('Razorpay Webhook Integration', () => {
       method: 'POST',
       headers: {
         'X-Razorpay-Signature': signature,
-        'X-Razorpay-Event-Id': crypto.randomUUID(),
+        'X-Razorpay-Event-Id': createEventId(),
         'Content-Length': String(payload.length)
       },
       body: payload
@@ -882,7 +889,7 @@ describe('Razorpay Webhook Integration', () => {
       method: 'POST',
       headers: {
         'X-Razorpay-Signature': signature,
-        'X-Razorpay-Event-Id': crypto.randomUUID(),
+        'X-Razorpay-Event-Id': createEventId(),
         'Transfer-Encoding': 'chunked'
       },
       body: stream as any,
