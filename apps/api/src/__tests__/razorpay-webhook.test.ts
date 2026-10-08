@@ -87,7 +87,8 @@ describe('Razorpay Webhook Route', () => {
 
     vi.mocked(webhookClaim.claimRazorpayWebhookEvent).mockResolvedValue({
       status: 'newly_claimed',
-      eventId: 'evt_123'
+      eventId: 'evt_123',
+      processingLeaseId: 'lease_123'
     });
 
     const res = await app.request('/public-api/webhooks/razorpay', {
@@ -114,7 +115,8 @@ describe('Razorpay Webhook Route', () => {
 
     vi.mocked(webhookClaim.claimRazorpayWebhookEvent).mockResolvedValue({
       status: 'newly_claimed',
-      eventId: 'evt_123'
+      eventId: 'evt_123',
+      processingLeaseId: 'lease_123'
     });
 
     const res = await app.request('/public-api/webhooks/razorpay', {
@@ -130,7 +132,8 @@ describe('Razorpay Webhook Route', () => {
     expect(webhookClaim.resolveRazorpayWebhookEvent).toHaveBeenCalledWith(
       'evt_123',
       'IGNORED',
-      'Unsupported event type'
+      'Unsupported event type',
+      'lease_123'
     );
   });
 

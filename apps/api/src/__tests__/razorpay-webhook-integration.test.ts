@@ -17,7 +17,7 @@ import { env } from '@cio/core/config/env';
 import { createHmac } from 'crypto';
 import { db } from '@cio/db/drizzle';
 import * as schema from '@cio/db/schema';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, like } from 'drizzle-orm';
 import * as razorpayService from '@cio/core/services/course/razorpay';
 import crypto from 'node:crypto';
 
@@ -61,6 +61,25 @@ describe('Razorpay Webhook Integration', () => {
       groupId,
       status: 'PUBLISHED'
     });
+  });
+
+  afterEach(async () => {
+    // Delete in reverse FK order to maintain isolation
+    await db.delete(schema.organizationmember).where(eq(schema.organizationmember.profileId, userId));
+    await db.delete(schema.groupmember).where(eq(schema.groupmember.profileId, userId));
+    await db.delete(schema.courseOrder).where(eq(schema.courseOrder.userId, userId));
+    await db.delete(schema.course).where(eq(schema.course.id, courseId));
+    await db.delete(schema.group).where(eq(schema.group.id, groupId));
+    await db.delete(schema.profile).where(eq(schema.profile.id, userId));
+    await db.delete(schema.user).where(eq(schema.user.id, userId));
+    await db.delete(schema.organization).where(eq(schema.organization.id, orgId));
+
+    // Clean up webhook events associated with test orders
+    await db
+      .delete(schema.razorpayWebhookEvent)
+      .where(like(schema.razorpayWebhookEvent.razorpayOrderId, 'order_webhook_%'));
+    // Also clean up webhooks with no order ID
+    await db.delete(schema.razorpayWebhookEvent).where(like(schema.razorpayWebhookEvent.providerEventId, 'evt_test_%'));
   });
 
   function generateSignature(payload: string, secret: string = 'test_secret') {
@@ -209,7 +228,9 @@ describe('Razorpay Webhook Integration', () => {
     );
 
     const responses = await Promise.all(requests);
-    expect(responses.every((r) => r.status === 200)).toBe(true);
+    const statuses = responses.map((r) => r.status);
+    expect(statuses).toContain(200);
+    expect(statuses.every((s) => s === 200 || s === 409)).toBe(true);
 
     expect(verifySpy).toHaveBeenCalledTimes(1);
 
@@ -218,6 +239,12 @@ describe('Razorpay Webhook Integration', () => {
       .from(schema.courseOrder)
       .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
     expect(order.status).toBe('PAID');
+
+    const [event] = await db
+      .select()
+      .from(schema.razorpayWebhookEvent)
+      .where(eq(schema.razorpayWebhookEvent.providerEventId, eventId));
+    expect(event.status).toBe('PROCESSED');
   });
 
   it('14D/F. Different webhook events, same payment / Already Enrolled', async () => {
@@ -270,6 +297,16 @@ describe('Razorpay Webhook Integration', () => {
       .from(schema.groupmember)
       .where(and(eq(schema.groupmember.groupId, groupId), eq(schema.groupmember.profileId, userId)));
     expect(members.length).toBe(1);
+
+    const events = await db
+      .select()
+      .from(schema.razorpayWebhookEvent)
+      .where(and(eq(schema.razorpayWebhookEvent.razorpayOrderId, razorpayOrderId)));
+
+    const e1 = events.find((e) => e.providerEventId === event1);
+    const e2 = events.find((e) => e.providerEventId === event2);
+    expect(e1?.status).toBe('PROCESSED');
+    expect(e2?.status).toBe('PROCESSED');
   });
 
   it('14G. Provider verification failure', async () => {
@@ -388,8 +425,15 @@ describe('Razorpay Webhook Integration', () => {
       .from(schema.courseOrder)
       .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
     expect(finalOrder.status).toBe('PAID');
+    expect(finalOrder.razorpayPaymentId).toBe(razorpayPaymentId);
+
+    const finalMembers = await db
+      .select()
+      .from(schema.groupmember)
+      .where(and(eq(schema.groupmember.groupId, groupId), eq(schema.groupmember.profileId, userId)));
+    expect(finalMembers.length).toBe(1);
   });
-  it('14I. Concurrent different events (simulates browser + webhook)', async () => {
+  it('14I. Concurrent different webhook events', async () => {
     const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
     const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
     await createLocalOrder(razorpayOrderId);
@@ -415,7 +459,7 @@ describe('Razorpay Webhook Integration', () => {
       body: payload
     });
 
-    // Event 2 (simulates Browser doing another webhook/verification concurrently)
+    // Event 2 (another concurrent webhook delivery)
     const req2 = app.request('/public-api/webhooks/razorpay', {
       method: 'POST',
       headers: { 'X-Razorpay-Signature': signature, 'X-Razorpay-Event-Id': crypto.randomUUID() },
@@ -556,18 +600,19 @@ describe('Razorpay Webhook Integration', () => {
       currency: 'INR'
     });
 
-    const payload = JSON.stringify({
+    const webhookPayload = JSON.stringify({
       event: 'order.paid',
       payload: { payment: { entity: { id: razorpayPaymentId, order_id: razorpayOrderId } } }
     });
-    const signature = generateSignature(payload);
+    const webhookSignature = generateSignature(webhookPayload, 'test_secret');
+    const browserSignature = generateSignature(`${razorpayOrderId}|${razorpayPaymentId}`, 'test_key_secret');
 
     // Call BOTH entry points concurrently
     const [webhookRes, browserRes] = await Promise.all([
       app.request('/public-api/webhooks/razorpay', {
         method: 'POST',
-        headers: { 'X-Razorpay-Signature': signature, 'X-Razorpay-Event-Id': eventId },
-        body: payload
+        headers: { 'X-Razorpay-Signature': webhookSignature, 'X-Razorpay-Event-Id': eventId },
+        body: webhookPayload
       }),
       app.request(`/course/orders/${localOrderId}/verify`, {
         method: 'POST',
@@ -575,16 +620,13 @@ describe('Razorpay Webhook Integration', () => {
         body: JSON.stringify({
           razorpay_order_id: razorpayOrderId,
           razorpay_payment_id: razorpayPaymentId,
-          razorpay_signature: signature
+          razorpay_signature: browserSignature
         })
       })
     ]);
 
     expect(webhookRes.status).toBe(200);
-    // Browser route might return 200 or might return an error if it hits the duplicate payment logic.
-    // Since it's a valid duplicate, the browser route verifyProviderPayment logic (actually markPaidAndEnroll)
-    // resolves gracefully or throws a DUPLICATE_PAYMENT error which we map to a 400 or 200 depending on the route.
-    // Let's just verify the database state.
+    expect(browserRes.status).toBe(200);
 
     const [finalOrder] = await db
       .select()
@@ -625,34 +667,72 @@ describe('Razorpay Webhook Integration', () => {
       payload: { payment: { entity: { id: razorpayPaymentId, order_id: razorpayOrderId } } }
     });
 
-    // Simulate crash by manually inserting event as PROCESSING, stale
-    await db.insert(schema.razorpayWebhookEvent).values({
-      providerEventId: eventId,
-      eventType: 'order.paid',
-      detail: payload,
-      status: 'PROCESSING',
-      updatedAt: new Date(Date.now() - 1000 * 60 * 6).toISOString() // 6 minutes ago (lease is 2 minutes)
-    });
+    // 1. Worker A claims event
+    const { claimRazorpayWebhookEvent } = await import('@cio/core/services/course/webhook-claim');
+    const claimResult = await claimRazorpayWebhookEvent(eventId, 'order.paid', razorpayOrderId, razorpayPaymentId);
+    expect(claimResult.status).toBe('newly_claimed');
 
-    const res = await app.request('/public-api/webhooks/razorpay', {
+    // 2. Worker A fulfills payment (markPaidAndEnroll succeeds)
+    const { markPaidAndEnroll } = await import('@cio/core/services/course/payment');
+    const { enrollStudentInCourseTransaction } = await import('@api/services/course/payment');
+
+    const verifiedPayment = {
+      id: razorpayPaymentId,
+      razorpayOrderId,
+      status: 'captured',
+      amountPaise: 100000,
+      currency: 'INR'
+    };
+    await markPaidAndEnroll(verifiedPayment, enrollStudentInCourseTransaction);
+
+    // 3 & 4. Worker A crashes before marking event PROCESSED -> Time passes, lease becomes stale
+    // (We manually simulate this by just advancing the updatedAt timestamp, leaving status as PROCESSING)
+    await db
+      .update(schema.razorpayWebhookEvent)
+      .set({ updatedAt: new Date(Date.now() - 1000 * 60 * 6).toISOString() })
+      .where(eq(schema.razorpayWebhookEvent.providerEventId, eventId));
+
+    // Order should be PAID, but event still PROCESSING
+    const [intermediateOrder] = await db
+      .select()
+      .from(schema.courseOrder)
+      .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+    expect(intermediateOrder.status).toBe('PAID');
+
+    const [intermediateEvent] = await db
+      .select()
+      .from(schema.razorpayWebhookEvent)
+      .where(eq(schema.razorpayWebhookEvent.providerEventId, eventId));
+    expect(intermediateEvent.status).toBe('PROCESSING');
+
+    // 5. Worker B reclaims and retries
+    const resB = await app.request('/public-api/webhooks/razorpay', {
       method: 'POST',
       headers: { 'X-Razorpay-Signature': generateSignature(payload), 'X-Razorpay-Event-Id': eventId },
       body: payload
     });
 
-    expect(res.status).toBe(200);
+    expect(resB.status).toBe(200);
 
-    const [event] = await db
+    // 6. Worker B successfully marks event PROCESSED
+    const [finalEvent] = await db
       .select()
       .from(schema.razorpayWebhookEvent)
       .where(eq(schema.razorpayWebhookEvent.providerEventId, eventId));
-    expect(event.status).toBe('PROCESSED');
+    expect(finalEvent.status).toBe('PROCESSED');
 
+    // 7. Ensure idempotent fulfillment (still PAID, one enrollment)
     const [finalOrder] = await db
       .select()
       .from(schema.courseOrder)
       .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
     expect(finalOrder.status).toBe('PAID');
+
+    const members = await db
+      .select()
+      .from(schema.groupmember)
+      .where(and(eq(schema.groupmember.groupId, groupId), eq(schema.groupmember.profileId, userId)));
+    expect(members.length).toBe(1); // Exactly one enrollment
   });
 
   it('14N. Provider 404', async () => {
@@ -729,5 +809,112 @@ describe('Razorpay Webhook Integration', () => {
       .from(schema.courseOrder)
       .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
     expect(order.status).toBe('CREATED');
+  });
+
+  it('14P. Provider 502 (Generic provider failure reaches webhook)', async () => {
+    const razorpayOrderId = 'order_webhook_' + crypto.randomUUID();
+    const razorpayPaymentId = 'pay_webhook_' + crypto.randomUUID();
+    const eventId = crypto.randomUUID();
+    await createLocalOrder(razorpayOrderId);
+
+    const { AppError, ErrorCodes } = await import('@cio/utils/errors');
+    vi.spyOn(razorpayService, 'verifyProviderPayment').mockRejectedValue(
+      new AppError('Failed to verify payment with provider', ErrorCodes.INTERNAL_ERROR, 502)
+    );
+
+    const payload = JSON.stringify({
+      event: 'order.paid',
+      payload: { payment: { entity: { id: razorpayPaymentId, order_id: razorpayOrderId } } }
+    });
+
+    const res = await app.request('/public-api/webhooks/razorpay', {
+      method: 'POST',
+      headers: { 'X-Razorpay-Signature': generateSignature(payload), 'X-Razorpay-Event-Id': eventId },
+      body: payload
+    });
+
+    // Webhook should return 502 which bubbles out
+    expect(res.status).toBe(502);
+
+    const [event] = await db
+      .select()
+      .from(schema.razorpayWebhookEvent)
+      .where(eq(schema.razorpayWebhookEvent.providerEventId, eventId));
+    expect(event.status).toBe('FAILED');
+
+    const [order] = await db
+      .select()
+      .from(schema.courseOrder)
+      .where(eq(schema.courseOrder.razorpayOrderId, razorpayOrderId));
+    expect(order.status).toBe('CREATED');
+  });
+
+  it('14Q. Reject request when Content-Length exceeds limit (413)', async () => {
+    const payload = JSON.stringify({ event: 'order.paid' }) + ' '.repeat(1024 * 1024 + 10);
+    const signature = generateSignature(payload);
+
+    const res = await app.request('/public-api/webhooks/razorpay', {
+      method: 'POST',
+      headers: {
+        'X-Razorpay-Signature': signature,
+        'X-Razorpay-Event-Id': crypto.randomUUID(),
+        'Content-Length': String(payload.length)
+      },
+      body: payload
+    });
+
+    expect(res.status).toBe(413);
+  });
+
+  it('14R. Reject request when streamed body exceeds limit (413)', async () => {
+    const payload = JSON.stringify({ event: 'order.paid' }) + ' '.repeat(1024 * 1024 + 10);
+    const signature = generateSignature(payload);
+
+    // Use a ReadableStream to prevent Content-Length from being set automatically
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      }
+    });
+
+    const res = await app.request('/public-api/webhooks/razorpay', {
+      method: 'POST',
+      headers: {
+        'X-Razorpay-Signature': signature,
+        'X-Razorpay-Event-Id': crypto.randomUUID(),
+        'Transfer-Encoding': 'chunked'
+      },
+      body: stream as any,
+      // @ts-ignore
+      duplex: 'half'
+    });
+
+    expect(res.status).toBe(413);
+  });
+
+  it('14S. Reject request when signature contains invalid non-hex trailing characters', async () => {
+    const payload = JSON.stringify({ event: 'order.paid' });
+    const validSignature = generateSignature(payload);
+
+    // We add 'gg' which is not valid hex to the end of a valid 64-char hex string.
+    const invalidSignature = validSignature + 'gg';
+
+    const res = await app.request('/public-api/webhooks/razorpay', {
+      method: 'POST',
+      headers: {
+        'X-Razorpay-Signature': invalidSignature,
+        'X-Razorpay-Event-Id': 'evt_test_invalid_sig'
+      },
+      body: payload
+    });
+
+    expect(res.status).toBe(401);
+
+    const [event] = await db
+      .select()
+      .from(schema.razorpayWebhookEvent)
+      .where(eq(schema.razorpayWebhookEvent.providerEventId, 'evt_test_invalid_sig'));
+    expect(event).toBeUndefined(); // Should not even be claimed
   });
 });

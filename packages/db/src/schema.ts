@@ -4347,6 +4347,7 @@ export const razorpayWebhookEvent = pgTable('razorpay_webhook_event', {
   status: razorpayWebhookEventStatus('status').notNull(),
   razorpayOrderId: text('razorpay_order_id'),
   razorpayPaymentId: text('razorpay_payment_id'),
+  processingLeaseId: uuid('processing_lease_id'),
   detail: text('detail'),
   createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'string' }).defaultNow().notNull()

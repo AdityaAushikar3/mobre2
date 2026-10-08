@@ -1,11 +1,12 @@
 import { db } from '@cio/db/drizzle';
 import { razorpayWebhookEvent } from '@cio/db/schema';
 import { eq, and } from 'drizzle-orm';
+import crypto from 'node:crypto';
 
 export const WEBHOOK_LEASE_MS = 2 * 60 * 1000;
 
 export type ClaimResult =
-  | { status: 'newly_claimed'; eventId: string }
+  | { status: 'newly_claimed'; eventId: string; processingLeaseId: string }
   | { status: 'in_progress'; eventId: string }
   | { status: 'duplicate_done'; eventId: string };
 
@@ -16,6 +17,8 @@ export async function claimRazorpayWebhookEvent(
   razorpayPaymentId?: string
 ): Promise<ClaimResult> {
   // 1. Try to insert new event
+  const processingLeaseId = crypto.randomUUID();
+
   const [inserted] = await db
     .insert(razorpayWebhookEvent)
     .values({
@@ -23,13 +26,14 @@ export async function claimRazorpayWebhookEvent(
       eventType,
       status: 'PROCESSING',
       razorpayOrderId,
-      razorpayPaymentId
+      razorpayPaymentId,
+      processingLeaseId
     })
     .onConflictDoNothing({ target: razorpayWebhookEvent.providerEventId })
     .returning();
 
   if (inserted) {
-    return { status: 'newly_claimed', eventId: inserted.id };
+    return { status: 'newly_claimed', eventId: inserted.id, processingLeaseId: inserted.processingLeaseId! };
   }
 
   // 2. Already exists. Fetch it.
@@ -55,10 +59,12 @@ export async function claimRazorpayWebhookEvent(
   }
 
   // 3. Stale PROCESSING or FAILED. Reclaim it atomically.
+  const newLeaseId = crypto.randomUUID();
   const [updated] = await db
     .update(razorpayWebhookEvent)
     .set({
       status: 'PROCESSING',
+      processingLeaseId: newLeaseId,
       updatedAt: now.toISOString()
     })
     .where(
@@ -71,7 +77,7 @@ export async function claimRazorpayWebhookEvent(
     .returning();
 
   if (updated) {
-    return { status: 'newly_claimed', eventId: updated.id };
+    return { status: 'newly_claimed', eventId: updated.id, processingLeaseId: updated.processingLeaseId! };
   }
 
   // If update failed, another worker claimed it or it was processed
@@ -81,14 +87,30 @@ export async function claimRazorpayWebhookEvent(
 export async function resolveRazorpayWebhookEvent(
   eventId: string,
   status: 'PROCESSED' | 'IGNORED' | 'FAILED',
-  detail?: string
+  detail?: string,
+  processingLeaseId?: string
 ) {
-  await db
+  const conditions = [eq(razorpayWebhookEvent.id, eventId)];
+
+  if (processingLeaseId) {
+    conditions.push(eq(razorpayWebhookEvent.status, 'PROCESSING'));
+    conditions.push(eq(razorpayWebhookEvent.processingLeaseId, processingLeaseId));
+  }
+
+  const [updated] = await db
     .update(razorpayWebhookEvent)
     .set({
       status,
       detail,
+      processingLeaseId: null, // Clear lease on terminal state
       updatedAt: new Date().toISOString()
     })
-    .where(eq(razorpayWebhookEvent.id, eventId));
+    .where(and(...conditions))
+    .returning();
+
+  if (!updated && processingLeaseId) {
+    return { status: 'lost_lease' };
+  }
+
+  return { status: 'resolved' };
 }

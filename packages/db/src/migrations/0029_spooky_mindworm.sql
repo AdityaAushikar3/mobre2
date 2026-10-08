@@ -1,0 +1,1 @@
+ALTER TABLE "razorpay_webhook_event" ADD COLUMN "processing_lease_id" uuid;
