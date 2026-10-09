@@ -25,6 +25,14 @@ vi.mock('@cio/core/config/env', () => ({
 describe('Razorpay Webhook Route', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(webhookClaim.claimRazorpayWebhookEvent).mockReset();
+    vi.mocked(webhookClaim.resolveRazorpayWebhookEvent).mockReset();
+    vi.mocked(webhookClaim.resolveRazorpayWebhookEvent).mockResolvedValue({ status: 'resolved' });
+    vi.mocked(razorpayService.verifyProviderPayment).mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   function generateSignature(payload: string, secret: string = 'test_secret') {
@@ -46,10 +54,11 @@ describe('Razorpay Webhook Route', () => {
 
   it('rejects invalid signature', async () => {
     const payload = JSON.stringify({ event: 'order.paid' });
+    const invalidSignature = generateSignature(payload, 'wrong_secret');
     const res = await app.request('/public-api/webhooks/razorpay', {
       method: 'POST',
       headers: {
-        'X-Razorpay-Signature': 'invalidsignatureofsamellength1234567890123456789012345678901234',
+        'X-Razorpay-Signature': invalidSignature,
         'X-Razorpay-Event-Id': 'evt_123'
       },
       body: payload
@@ -57,7 +66,7 @@ describe('Razorpay Webhook Route', () => {
     expect(res.status).toBe(401);
   });
 
-  it('safely rejects signature length mismatch', async () => {
+  it('rejects malformed signature before HMAC comparison', async () => {
     const payload = JSON.stringify({ event: 'order.paid' });
     const res = await app.request('/public-api/webhooks/razorpay', {
       method: 'POST',
