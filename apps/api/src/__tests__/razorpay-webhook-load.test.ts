@@ -16,16 +16,22 @@ import { createHmac } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 
 describe('Webhook Load & Concurrency Validation', () => {
-  const WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || 'test_secret';
+  const WEBHOOK_SECRET = 'test_secret';
   let orgId: string;
   let userId: string;
   let courseId: string;
   let orderId: string;
+  let rzpOrderId: string;
+  let rzpPaymentId: string;
+  let sharedEvtId: string;
 
   beforeAll(async () => {
     orgId = crypto.randomUUID();
     userId = crypto.randomUUID();
     courseId = crypto.randomUUID();
+    rzpOrderId = `order_${crypto.randomUUID()}`;
+    rzpPaymentId = `pay_${crypto.randomUUID()}`;
+    sharedEvtId = `evt_shared_${crypto.randomUUID()}`;
 
     const groupId = crypto.randomUUID();
 
@@ -48,7 +54,7 @@ describe('Webhook Load & Concurrency Validation', () => {
       groupId: groupId,
       title: 'Load Test Course',
       description: 'Load test course description',
-      slug: 'load-course',
+      slug: `load-course-${crypto.randomUUID()}`,
       cost: 10000,
       isTemplate: false
     });
@@ -56,9 +62,7 @@ describe('Webhook Load & Concurrency Validation', () => {
 
   afterAll(async () => {
     await db.delete(schema.courseOrder).where(eq(schema.courseOrder.organizationId, orgId));
-    await db
-      .delete(schema.razorpayWebhookEvent)
-      .where(eq(schema.razorpayWebhookEvent.razorpayOrderId, 'order_load_123'));
+    await db.delete(schema.razorpayWebhookEvent).where(eq(schema.razorpayWebhookEvent.razorpayOrderId, rzpOrderId));
     await db.delete(schema.course).where(eq(schema.course.id, courseId));
     await db.delete(schema.groupmember).where(eq(schema.groupmember.profileId, userId));
     await db.delete(schema.organizationmember).where(eq(schema.organizationmember.profileId, userId));
@@ -78,16 +82,14 @@ describe('Webhook Load & Concurrency Validation', () => {
       courseId: courseId,
       amountPaise: 10000,
       currency: 'INR',
-      razorpayOrderId: 'order_load_123',
+      razorpayOrderId: rzpOrderId,
       status: 'CREATED'
     });
   });
 
   afterEach(async () => {
     await db.delete(schema.courseOrder).where(eq(schema.courseOrder.id, orderId));
-    await db
-      .delete(schema.razorpayWebhookEvent)
-      .where(eq(schema.razorpayWebhookEvent.razorpayOrderId, 'order_load_123'));
+    await db.delete(schema.razorpayWebhookEvent).where(eq(schema.razorpayWebhookEvent.razorpayOrderId, rzpOrderId));
     await db.delete(schema.organizationmember).where(eq(schema.organizationmember.organizationId, orgId));
   });
 
@@ -97,16 +99,16 @@ describe('Webhook Load & Concurrency Validation', () => {
       account_id: 'acc_load',
       contains: ['payment', 'order'],
       payload: {
-        order: { entity: { id: 'order_load_123', amount: 10000, amount_paid: 10000, status: 'paid' } },
-        payment: { entity: { id: 'pay_load_123', amount: 10000, status: 'captured' } }
+        order: { entity: { id: rzpOrderId, amount: 10000, amount_paid: 10000, status: 'paid' } },
+        payment: { entity: { id: rzpPaymentId, amount: 10000, status: 'captured' } }
       }
     };
     const body = JSON.stringify(payload);
 
     vi.spyOn(razorpayService, 'verifyProviderPayment').mockResolvedValue({
       status: 'captured',
-      id: 'pay_load_123',
-      razorpayOrderId: 'order_load_123',
+      id: rzpPaymentId,
+      razorpayOrderId: rzpOrderId,
       amountPaise: 10000,
       currency: 'INR'
     } as any);
@@ -116,7 +118,7 @@ describe('Webhook Load & Concurrency Validation', () => {
 
     const requests = Array.from({ length: CONCURRENCY }).map((_, i) => {
       // Half requests send exact same event id, half send different event ids
-      const evtId = i % 2 === 0 ? 'evt_load_shared' : `evt_load_${i}`;
+      const evtId = i % 2 === 0 ? sharedEvtId : `evt_load_${i}_${crypto.randomUUID()}`;
       const payloadWithEvt = {
         ...payload,
         account_id: 'acc_load',
@@ -158,9 +160,9 @@ describe('Webhook Load & Concurrency Validation', () => {
     // Invariants Check
     const [finalOrder] = await db.select().from(schema.courseOrder).where(eq(schema.courseOrder.id, orderId));
     expect(finalOrder.status).toBe('PAID');
-    expect(finalOrder.razorpayPaymentId).toBe('pay_load_123');
+    expect(finalOrder.razorpayPaymentId).toBe(rzpPaymentId);
 
-    // Only 1 fulfillment should have occurred (only 1 verifyProviderPayment call)
+    // 8 provider-verification calls are expected for 8 distinct claimed event IDs, while duplicate deliveries of the shared event ID should be deduplicated. The intended outcome is a single effective course enrollment.
     expect(razorpayService.verifyProviderPayment).toHaveBeenCalledTimes(8);
 
     // Membership should only be created once
@@ -169,6 +171,16 @@ describe('Webhook Load & Concurrency Validation', () => {
       .from(schema.organizationmember)
       .where(eq(schema.organizationmember.profileId, userId));
     expect(members.length).toBe(1);
+
+    const groupMembers = await db.select().from(schema.groupmember).where(eq(schema.groupmember.profileId, userId));
+    expect(groupMembers.length).toBe(1);
+
+    const events = await db
+      .select()
+      .from(schema.razorpayWebhookEvent)
+      .where(eq(schema.razorpayWebhookEvent.razorpayOrderId, rzpOrderId));
+    expect(events.length).toBe(8);
+    events.forEach((e) => expect(e.status).toBe('PROCESSED'));
 
     // Total success responses should be equal to the number of successful processing + idempotently returned 200s
     expect(successCount + retryCount).toBe(CONCURRENCY);

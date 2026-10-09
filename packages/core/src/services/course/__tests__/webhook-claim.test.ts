@@ -131,4 +131,31 @@ describe('Webhook Claim Module', () => {
     expect(row.status).toBe('FAILED');
     expect(row.detail).toBe('Failed by B');
   });
+
+  it('prevents stale worker from overwriting state (A attempts to resolve as IGNORED)', async () => {
+    const eventId = createEventId();
+    // 1. Worker A claims event
+    const resA = await claimRazorpayWebhookEvent(eventId, 'order.paid');
+    const tokenA = (resA as any).processingLeaseId;
+    const dbEventId = (resA as any).eventId;
+
+    // 2. Make the lease stale
+    vi.advanceTimersByTime(WEBHOOK_LEASE_MS + 1000);
+
+    // 3. Worker B reclaims event
+    const resB = await claimRazorpayWebhookEvent(eventId, 'order.paid');
+    const tokenB = (resB as any).processingLeaseId;
+
+    // 4. Worker B resolves event as PROCESSED
+    await resolveRazorpayWebhookEvent(dbEventId, 'PROCESSED', 'Done by B', tokenB);
+
+    // 5. Worker A later attempts to resolve same event as IGNORED using token A
+    const resolveA = await resolveRazorpayWebhookEvent(dbEventId, 'IGNORED', 'Ignored by A', tokenA);
+    expect(resolveA.status).toBe('lost_lease');
+
+    // 6. Final DB state remains PROCESSED
+    const [row] = await db.select().from(razorpayWebhookEvent).where(eq(razorpayWebhookEvent.id, dbEventId));
+    expect(row.status).toBe('PROCESSED');
+    expect(row.detail).toBe('Done by B');
+  });
 });

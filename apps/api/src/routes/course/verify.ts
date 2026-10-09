@@ -91,7 +91,10 @@ export const verifyRouter = new Hono().post('/orders/:orderId/verify', authMiddl
       try {
         await runPostCommitSideEffects(result.effects);
       } catch (err) {
-        console.error('Fatal error in side effects (should be caught internally):', err);
+        console.error(
+          '[VERIFY_SIDE_EFFECT_ERROR] Failed to process post-verification side effects for order:',
+          orderId
+        );
       }
     }
 
