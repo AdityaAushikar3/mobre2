@@ -21,7 +21,7 @@ export type PaymentProcessResult = {
 export class EnrollmentFailedError extends Error {
   constructor(
     message: string,
-    public cause?: any
+    public cause?: unknown
   ) {
     super(message);
     this.name = 'EnrollmentFailedError';

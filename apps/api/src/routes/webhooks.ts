@@ -66,9 +66,6 @@ export const webhooksRouter = new Hono()
       const expectedBuffer = Buffer.from(expectedSignature, 'hex');
       const actualBuffer = Buffer.from(signature, 'hex');
 
-      if (expectedBuffer.length !== actualBuffer.length) {
-        throw new AppError('Invalid signature length', ErrorCodes.UNAUTHORIZED, 401);
-      }
       if (!timingSafeEqual(expectedBuffer, actualBuffer)) {
         throw new AppError('Invalid signature', ErrorCodes.UNAUTHORIZED, 401);
       }
@@ -198,7 +195,11 @@ export const webhooksRouter = new Hono()
           safeDetail = 'Enrollment failed';
         }
 
-        await resolveRazorpayWebhookEvent(claim.eventId, 'FAILED', safeDetail, claim.processingLeaseId);
+        try {
+          await resolveRazorpayWebhookEvent(claim.eventId, 'FAILED', safeDetail, claim.processingLeaseId);
+        } catch {
+          console.error('Failed to persist webhook failure state');
+        }
 
         if (statusCode >= 500) {
           const sanitizedError = createSanitizedWebhookError(safeDetail, error);

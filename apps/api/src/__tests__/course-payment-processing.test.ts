@@ -618,7 +618,7 @@ describe('Course Payment Processing State Machine', () => {
       );
 
       const spyCalls = consoleErrorSpy.mock.calls.map((args) => args.join(' ')).join(' ');
-      expect(spyCalls).toContain('intentional rollback');
+      expect(spyCalls).toContain('[ENROLLMENT_FAILED] Local Order:');
       consoleErrorSpy.mockRestore();
 
       const [updatedOrder] = await db

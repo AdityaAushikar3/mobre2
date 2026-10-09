@@ -22,6 +22,10 @@ import * as razorpayService from '@cio/core/services/course/razorpay';
 import crypto from 'node:crypto';
 import * as Sentry from '@sentry/node';
 
+import { AppError } from '@api/utils/errors';
+import * as apiPaymentService from '@api/services/course/payment';
+import * as corePaymentService from '@cio/core/services/course/payment';
+
 vi.mock('@cio/core/config/env', () => ({
   env: {
     RAZORPAY_WEBHOOK_SECRET: 'test_secret',
@@ -32,6 +36,7 @@ vi.mock('@cio/core/config/env', () => ({
 
 vi.mock('@sentry/node', () => ({
   captureException: vi.fn(),
+  captureMessage: vi.fn(),
   setUser: vi.fn(),
   init: vi.fn(),
   flush: vi.fn().mockResolvedValue(true)
@@ -1042,14 +1047,14 @@ describe('Razorpay Webhook Integration', () => {
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     // Force an effect to fail
-    vi.mocked(paymentService.markPaidAndEnroll).mockResolvedValue({
+    vi.spyOn(corePaymentService, 'markPaidAndEnroll').mockResolvedValue({
       handled: true,
       alreadyEnrolled: false,
       order: { id: 'order_123', razorpayOrderId: 'order_123' } as any,
       effects: [{ type: 'TEST_EFFECT' }]
     });
 
-    vi.mocked(paymentService.runPostCommitSideEffects).mockRejectedValue(
+    vi.spyOn(apiPaymentService, 'runPostCommitSideEffects').mockRejectedValue(
       new Error('Failed effect due to db password=SECRET_VALUE')
     );
 
@@ -1071,5 +1076,31 @@ describe('Razorpay Webhook Integration', () => {
     expect(consoleErrorSpy).toHaveBeenCalled();
     const logCalls = consoleErrorSpy.mock.calls.map((args) => args.join(' ')).join(' ');
     expect(logCalls).not.toContain('SECRET_VALUE');
+  });
+
+  it('14W. Rejects an otherwise valid webhook with a mathematically perfect HMAC but the wrong secret', async () => {
+    vi.clearAllMocks();
+    const eventId = createEventId();
+
+    const payload = JSON.stringify({
+      event: 'order.paid',
+      payload: { payment: { entity: { id: 'pay_123', order_id: 'order_123' } } }
+    });
+
+    // Generate valid structure but wrong secret
+    const wrongSignature = crypto.createHmac('sha256', 'wrong_secret').update(payload).digest('hex');
+
+    const res = await app.request('/public-api/webhooks/razorpay', {
+      method: 'POST',
+      headers: {
+        'X-Razorpay-Signature': wrongSignature,
+        'X-Razorpay-Event-Id': eventId
+      },
+      body: payload
+    });
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe('Invalid signature');
   });
 });
